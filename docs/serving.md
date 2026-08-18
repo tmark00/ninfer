@@ -79,6 +79,8 @@ The endpoint supports:
 
 - `system`, `developer`, `user`, `assistant`, and `tool` history;
 - string content and ordered text, `image_url`, and `video_url` parts;
+- tool messages with string content or an array of `text` content parts (the OpenAI
+  contract allows no other part type for tool messages);
 - `max_completion_tokens` and the legacy `max_tokens` spelling;
 - `temperature`, `top_p`, `top_k`, presence/frequency penalties, and a nonnegative `seed`;
 - one stop string or an array of stop strings;

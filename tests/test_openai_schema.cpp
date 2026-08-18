@@ -477,6 +477,85 @@ int test_parse_tool_history_messages() {
     return failures;
 }
 
+int test_parse_tool_message_content_parts() {
+    int failures = 0;
+    Json tool_msg;
+    tool_msg["role"]         = "tool";
+    tool_msg["tool_call_id"] = "call_1";
+    tool_msg["content"]      = Json::array({Json{{"type", "text"}, {"text", R"({"temp":20})"}}});
+    Json body;
+    body["model"]    = "m";
+    body["messages"] = Json::array(
+        {Json{{"role", "user"}, {"content", "weather?"}},
+         Json{{"role", "assistant"},
+              {"content", nullptr},
+              {"tool_calls",
+               Json::array({Json{{"id", "call_1"},
+                                 {"type", "function"},
+                                 {"function",
+                                  Json{{"name", "get_weather"}, {"arguments", R"({"city":"Paris"})"}}}}})}},
+         tool_msg});
+    const GenerationRequest req = parse_chat_completion_request(body, default_limits());
+    failures += check(req.messages.size() == 3, "array tool content accepted");
+    failures += check(req.messages[2].role == ninfer::ChatRole::Tool, "tool role parsed");
+    failures += check(req.messages[2].tool_call_id == "call_1", "tool_call_id parsed");
+    failures += check(req.messages[2].content.size() == 1, "one tool content part");
+    failures += check(req.messages[2].content[0].kind == ContentKind::Text, "tool part kind");
+    failures += check(req.messages[2].content[0].text == R"({"temp":20})", "tool part text");
+
+    Json multi_tool;
+    multi_tool["role"]         = "tool";
+    multi_tool["tool_call_id"] = "call_1";
+    multi_tool["content"]      = Json::array({Json{{"type", "text"}, {"text", "a"}},
+                                              Json{{"type", "text"}, {"text", "b"}}});
+    Json multi;
+    multi["model"]    = "m";
+    multi["messages"] = Json::array({multi_tool});
+    const GenerationRequest multi_req = parse_chat_completion_request(multi, default_limits());
+    failures += check(multi_req.messages[0].content.size() == 2, "two tool text parts kept");
+
+    const Json str = {
+        {"model", "m"},
+        {"messages",
+         Json::array({Json{{"role", "tool"}, {"tool_call_id", "call_1"}, {"content", "plain"}}})}};
+    const GenerationRequest str_req = parse_chat_completion_request(str, default_limits());
+    failures += check(str_req.messages[0].content.size() == 1, "string tool content accepted");
+    failures += check(str_req.messages[0].content[0].text == "plain", "string tool content text");
+
+    Json empty_array = multi;
+    empty_array["messages"][0]["content"] = Json::array();
+    failures += check(
+        throws_api([&] { (void)parse_chat_completion_request(empty_array, default_limits()); }),
+        "empty tool content array rejected");
+    Json null_content = str;
+    null_content["messages"][0]["content"] = nullptr;
+    failures += check(
+        throws_api([&] { (void)parse_chat_completion_request(null_content, default_limits()); }),
+        "null tool content rejected");
+
+    for (const char* bad_type : {"image_url", "video_url", "input_audio", "file"}) {
+        Json bad_tool = multi_tool;
+        bad_tool["content"] =
+            Json::array({Json{{"type", bad_type},
+                              {"image_url", Json{{"url", "https://example.test/x.png"}}}}});
+        Json bad_body;
+        bad_body["model"]    = "m";
+        bad_body["messages"] = Json::array({bad_tool});
+        failures +=
+            check(throws_api([&] { (void)parse_chat_completion_request(bad_body, default_limits()); }),
+                  std::string("non-text tool content part '") + bad_type + "' rejected");
+    }
+    Json text_missing = multi_tool;
+    text_missing["content"] = Json::array({Json{{"type", "text"}}});
+    Json missing_body;
+    missing_body["model"]    = "m";
+    missing_body["messages"] = Json::array({text_missing});
+    failures += check(
+        throws_api([&] { (void)parse_chat_completion_request(missing_body, default_limits()); }),
+        "tool text part without 'text' field rejected");
+    return failures;
+}
+
 int test_parse_stop_and_max_tokens() {
     int failures          = 0;
     Json body             = {{"model", "m"},
@@ -717,6 +796,7 @@ int main() {
     failures += test_reject_unsupported();
     failures += test_parse_function_tools_and_choices();
     failures += test_parse_tool_history_messages();
+    failures += test_parse_tool_message_content_parts();
     failures += test_parse_stop_and_max_tokens();
     failures += test_parse_sampling_carried();
     failures += test_response_serialization();

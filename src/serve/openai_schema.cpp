@@ -1,5 +1,6 @@
 #include "serve/openai_schema.h"
 
+#include <algorithm>
 #include <array>
 #include <cctype>
 #include <chrono>
@@ -137,7 +138,7 @@ ninfer::product::media_acquire::Source parse_media_url(const Json& part, const c
 }
 
 void parse_content_parts(const Json& content, ChatTurn& turn, std::size_t index,
-                         bool text_only = false) {
+                         std::vector<std::string> allowed_types = {}) {
     if (content.is_string()) {
         turn.content.push_back(ContentPart{ContentKind::Text, content.get<std::string>(), "text"});
         return;
@@ -146,6 +147,11 @@ void parse_content_parts(const Json& content, ChatTurn& turn, std::size_t index,
         bad_request("message " + std::to_string(index) + " content must be a string or array",
                     "messages");
     }
+    std::string allowed_list;
+    for (const std::string& allowed : allowed_types) {
+        if (!allowed_list.empty()) { allowed_list += ", "; }
+        allowed_list += "'" + allowed + "'";
+    }
     for (const Json& part : content) {
         if (!part.is_object() || !part.contains("type") || !part.at("type").is_string()) {
             bad_request("message " + std::to_string(index) +
@@ -153,6 +159,12 @@ void parse_content_parts(const Json& content, ChatTurn& turn, std::size_t index,
                         "messages");
         }
         const std::string type = part.at("type").get<std::string>();
+        if (!allowed_types.empty() &&
+            std::find(allowed_types.begin(), allowed_types.end(), type) == allowed_types.end()) {
+            bad_request("message " + std::to_string(index) + " content parts must have type " +
+                            allowed_list,
+                        "messages");
+        }
         ContentPart out;
         out.type_raw = type;
         if (type == "text") {
@@ -161,10 +173,6 @@ void parse_content_parts(const Json& content, ChatTurn& turn, std::size_t index,
             }
             out.kind = ContentKind::Text;
             out.text = part.at("text").get<std::string>();
-        } else if (text_only) {
-            bad_request("message " + std::to_string(index) +
-                            " content parts must have type 'text'",
-                        "messages");
         } else if (type == "image_url") {
             out.kind   = ContentKind::Image;
             out.source = parse_media_url(part, "image_url");
@@ -260,7 +268,7 @@ void parse_messages(const Json& body, GenerationRequest& out) {
             }
             turn.tool_call_id = item.at("tool_call_id").get<std::string>();
             // Per the OpenAI contract, only text parts are valid in tool messages.
-            parse_content_parts(item.at("content"), turn, i, /*text_only=*/true);
+            parse_content_parts(item.at("content"), turn, i, {"text"});
             out.messages.push_back(std::move(turn));
             continue;
         }

@@ -1,8 +1,12 @@
 find_package(CUDAToolkit REQUIRED)
 find_package(Threads REQUIRED)
-find_package(PkgConfig REQUIRED)
-pkg_check_modules(FFMPEG REQUIRED IMPORTED_TARGET
-  libavformat libavcodec libavutil libswscale)
+
+# FFmpeg and libcurl are located cross-platform: pkg-config on POSIX, an
+# install prefix / vcpkg tree on Windows. Both are exposed as NInfer::FFmpeg
+# and NInfer::Curl (see cmake/NInferMediaDeps.cmake).
+list(APPEND CMAKE_MODULE_PATH "${PROJECT_SOURCE_DIR}/cmake")
+include(NInferMediaDeps)
+ninfer_find_ffmpeg()
 
 # Repository-pinned header dependencies. No configure-time downloads.
 add_library(ninfer::json INTERFACE IMPORTED GLOBAL)
@@ -15,7 +19,7 @@ add_subdirectory(third_party/llama-jinja EXCLUDE_FROM_ALL)
 if(NINFER_BUILD_PRODUCT_SUPPORT)
   # Media acquisition uses CURLOPT_PROTOCOLS_STR and CURLOPT_REDIR_PROTOCOLS_STR,
   # introduced in libcurl 7.85 (not merely the version of the maintainer environment).
-  pkg_check_modules(LIBCURL REQUIRED IMPORTED_TARGET libcurl>=7.85)
+  ninfer_find_curl()
   add_library(ninfer::httplib INTERFACE IMPORTED GLOBAL)
   target_include_directories(ninfer::httplib INTERFACE
     ${PROJECT_SOURCE_DIR}/third_party/cpp-httplib)

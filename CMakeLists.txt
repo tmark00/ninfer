@@ -39,6 +39,25 @@ if(NINFER_BUILD_APPS OR BUILD_TESTING)
   set(NINFER_BUILD_PRODUCT_SUPPORT ON)
 endif()
 
+if(MSVC)
+  # CUDA 13's CCCL (cuda/std) requires the conforming MSVC preprocessor. The
+  # flag is forwarded to the cl host compiler nvcc invokes, including for the
+  # host stubs it generates. (The 128-byte-aligned TMA descriptor parameters are
+  # passed by device pointer rather than by value precisely so MSVC's stub
+  # compiler does not reject them.)
+  add_compile_options($<$<COMPILE_LANGUAGE:C,CXX>:/Zc:preprocessor>)
+  set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -Xcompiler=/Zc:preprocessor")
+  # windows.h defines min/max as macros which clobber std::min/std::max; NOMINMAX
+  # suppresses them. UTF8PROC_STATIC keeps the vendored utf8proc header from
+  # marking its symbols __declspec(dllimport) since we compile it statically. Both
+  # are scoped to C/CXX (no CUDA file needs them) so the CUDA objects keep their
+  # cache. The block precedes the dependency includes so the vendored third-party
+  # targets are compiled with the same flags.
+  add_compile_definitions(
+    $<$<COMPILE_LANGUAGE:C,CXX>:NOMINMAX>
+    $<$<COMPILE_LANGUAGE:C,CXX>:UTF8PROC_STATIC>)
+endif()
+
 include(cmake/Dependencies.cmake)
 include(cmake/NinferTargets.cmake)
 

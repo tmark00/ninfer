@@ -2,7 +2,11 @@ add_library(ninfer_media_acquire STATIC
   media_acquire/acquire.cpp
 )
 ninfer_internal_includes(ninfer_media_acquire)
-target_link_libraries(ninfer_media_acquire PRIVATE PkgConfig::LIBCURL)
+target_link_libraries(ninfer_media_acquire PRIVATE NInfer::Curl)
+if(WIN32)
+  # Host name resolution / Winsock (getaddrinfo, inet_ntop, WSAStartup).
+  target_link_libraries(ninfer_media_acquire PRIVATE Ws2_32)
+endif()
 
 add_library(ninfer_product_prompt_input STATIC
   prompt_input/prompt_input.cpp

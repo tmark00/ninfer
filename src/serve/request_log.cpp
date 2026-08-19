@@ -17,7 +17,13 @@
 #include <system_error>
 #include <utility>
 
+#ifdef _WIN32
+#define NOMINMAX
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#else
 #include <unistd.h>
+#endif
 
 namespace ninfer::serve {
 namespace {
@@ -29,6 +35,14 @@ T monotonic_delta(T previous, T current) noexcept {
     return current >= previous ? current - previous : T{};
 }
 
+std::uint32_t process_id() {
+#ifdef _WIN32
+    return GetCurrentProcessId();
+#else
+    return static_cast<std::uint32_t>(::getpid());
+#endif
+}
+
 std::uint64_t unix_time_ms() {
     const auto now = std::chrono::system_clock::now().time_since_epoch();
     return static_cast<std::uint64_t>(
@@ -38,7 +52,7 @@ std::uint64_t unix_time_ms() {
 std::string new_server_instance_id() {
     const auto now    = std::chrono::system_clock::now().time_since_epoch();
     const auto micros = std::chrono::duration_cast<std::chrono::microseconds>(now).count();
-    return "serve-" + std::to_string(static_cast<long long>(::getpid())) + '-' +
+    return "serve-" + std::to_string(static_cast<long long>(process_id())) + '-' +
            std::to_string(micros);
 }
 

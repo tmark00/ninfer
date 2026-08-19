@@ -5,8 +5,12 @@
 
 #include <spdlog/logger.h>
 
+#ifdef _WIN32
+#include <windows.h>
+#else
 #include <sys/ioctl.h>
 #include <unistd.h>
+#endif
 
 #include <algorithm>
 #include <array>
@@ -76,8 +80,18 @@ PhasePresentation phase_presentation(StartupPhase phase) noexcept {
 }
 
 std::size_t terminal_columns() noexcept {
+#ifdef _WIN32
+    // Windows has no TIOCGWINSZ; the console screen buffer carries the same width.
+    CONSOLE_SCREEN_BUFFER_INFO info{};
+    const HANDLE handle = GetStdHandle(STD_ERROR_HANDLE);
+    if (handle != INVALID_HANDLE_VALUE && GetConsoleScreenBufferInfo(handle, &info) != 0) {
+        const int columns = info.srWindow.Right - info.srWindow.Left + 1;
+        if (columns > 0) { return static_cast<std::size_t>(columns); }
+    }
+#else
     winsize size{};
     if (::ioctl(STDERR_FILENO, TIOCGWINSZ, &size) == 0 && size.ws_col != 0) { return size.ws_col; }
+#endif
     return 120;
 }
 

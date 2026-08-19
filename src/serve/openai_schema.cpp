@@ -137,60 +137,6 @@ ninfer::product::media_acquire::Source parse_media_url(const Json& part, const c
     return source;
 }
 
-void parse_content_parts(const Json& content, ChatTurn& turn, std::size_t index,
-                         std::vector<std::string> allowed_types = {}) {
-    if (content.is_string()) {
-        turn.content.push_back(ContentPart{ContentKind::Text, content.get<std::string>(), "text"});
-        return;
-    }
-    if (!content.is_array()) {
-        bad_request("message " + std::to_string(index) + " content must be a string or array",
-                    "messages");
-    }
-    std::string allowed_list;
-    for (const std::string& allowed : allowed_types) {
-        if (!allowed_list.empty()) { allowed_list += ", "; }
-        allowed_list += "'" + allowed + "'";
-    }
-    for (const Json& part : content) {
-        if (!part.is_object() || !part.contains("type") || !part.at("type").is_string()) {
-            bad_request("message " + std::to_string(index) +
-                            " content parts must be objects with a string 'type'",
-                        "messages");
-        }
-        const std::string type = part.at("type").get<std::string>();
-        if (!allowed_types.empty() &&
-            std::find(allowed_types.begin(), allowed_types.end(), type) == allowed_types.end()) {
-            bad_request("message " + std::to_string(index) + " content parts must have type " +
-                            allowed_list,
-                        "messages");
-        }
-        ContentPart out;
-        out.type_raw = type;
-        if (type == "text") {
-            if (!part.contains("text") || !part.at("text").is_string()) {
-                bad_request("text content part must contain a string 'text'", "messages");
-            }
-            out.kind = ContentKind::Text;
-            out.text = part.at("text").get<std::string>();
-        } else if (type == "image_url") {
-            out.kind   = ContentKind::Image;
-            out.source = parse_media_url(part, "image_url");
-        } else if (type == "video_url") {
-            out.kind   = ContentKind::Video;
-            out.source = parse_media_url(part, "video_url");
-        } else if (type == "input_audio") {
-            out.kind = ContentKind::InputAudio;
-        } else {
-            out.kind = ContentKind::Unsupported;
-        }
-        turn.content.push_back(std::move(out));
-    }
-    if (turn.content.empty()) {
-        bad_request("message " + std::to_string(index) + " content must not be empty", "messages");
-    }
-}
-
 std::vector<ToolCall> parse_assistant_tool_calls(const Json& item, std::size_t index) {
     std::vector<ToolCall> calls;
     if (!item.contains("tool_calls") || item.at("tool_calls").is_null()) { return calls; }
@@ -491,6 +437,60 @@ Json tool_calls_json(const std::vector<ToolCall>& tool_calls, bool include_index
 std::string sse_event(const Json& payload) { return "data: " + payload.dump() + "\n\n"; }
 
 } // namespace
+
+void parse_content_parts(const Json& content, ChatTurn& turn, std::size_t index,
+                         std::vector<std::string> allowed_types) {
+    if (content.is_string()) {
+        turn.content.push_back(ContentPart{ContentKind::Text, content.get<std::string>(), "text"});
+        return;
+    }
+    if (!content.is_array()) {
+        bad_request("message " + std::to_string(index) + " content must be a string or array",
+                    "messages");
+    }
+    std::string allowed_list;
+    for (const std::string& allowed : allowed_types) {
+        if (!allowed_list.empty()) { allowed_list += ", "; }
+        allowed_list += "'" + allowed + "'";
+    }
+    for (const Json& part : content) {
+        if (!part.is_object() || !part.contains("type") || !part.at("type").is_string()) {
+            bad_request("message " + std::to_string(index) +
+                            " content parts must be objects with a string 'type'",
+                        "messages");
+        }
+        const std::string type = part.at("type").get<std::string>();
+        if (!allowed_types.empty() &&
+            std::find(allowed_types.begin(), allowed_types.end(), type) == allowed_types.end()) {
+            bad_request("message " + std::to_string(index) + " content parts must have type " +
+                            allowed_list,
+                        "messages");
+        }
+        ContentPart out;
+        out.type_raw = type;
+        if (type == "text") {
+            if (!part.contains("text") || !part.at("text").is_string()) {
+                bad_request("text content part must contain a string 'text'", "messages");
+            }
+            out.kind = ContentKind::Text;
+            out.text = part.at("text").get<std::string>();
+        } else if (type == "image_url") {
+            out.kind   = ContentKind::Image;
+            out.source = parse_media_url(part, "image_url");
+        } else if (type == "video_url") {
+            out.kind   = ContentKind::Video;
+            out.source = parse_media_url(part, "video_url");
+        } else if (type == "input_audio") {
+            out.kind = ContentKind::InputAudio;
+        } else {
+            out.kind = ContentKind::Unsupported;
+        }
+        turn.content.push_back(std::move(out));
+    }
+    if (turn.content.empty()) {
+        bad_request("message " + std::to_string(index) + " content must not be empty", "messages");
+    }
+}
 
 std::optional<bool> parse_openai_preserve_thinking(const Json& body) {
     std::optional<bool> top_level;

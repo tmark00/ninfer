@@ -46,6 +46,15 @@ std::string api_code(const std::function<void()>& f) {
     return {};
 }
 
+std::string api_message(const std::function<void()>& f) {
+    try {
+        f();
+    } catch (const ApiException& error) { return error.error().message; } catch (...) {
+        return "wrong_exception";
+    }
+    return {};
+}
+
 RequestLimits default_limits() {
     RequestLimits limits;
     limits.default_max_tokens = 512;
@@ -556,6 +565,79 @@ int test_parse_tool_message_content_parts() {
     return failures;
 }
 
+int test_parse_content_parts_allowed_types() {
+    int failures = 0;
+    ChatTurn all;
+    parse_content_parts(
+        Json::array(
+            {Json{{"type", "text"}, {"text", "a"}},
+             Json{{"type", "image_url"}, {"image_url", Json{{"url", "data:image/png;base64,AA=="}}}},
+             Json{{"type", "video_url"},
+                  {"video_url", Json{{"url", "https://example.test/clip.mp4"}}}},
+             Json{{"type", "input_audio"}}}),
+        all, 0);
+    failures += check(all.content.size() == 4, "default allowlist parses all normal parts");
+    failures += check(all.content[0].kind == ContentKind::Text, "default text kind");
+    failures += check(all.content[1].kind == ContentKind::Image, "default image kind");
+    failures += check(all.content[2].kind == ContentKind::Video, "default video kind");
+    failures += check(all.content[3].kind == ContentKind::InputAudio, "default input_audio kind");
+
+    ChatTurn str;
+    parse_content_parts(Json("plain"), str, 0, {"text"});
+    failures += check(str.content.size() == 1 && str.content[0].kind == ContentKind::Text &&
+                          str.content[0].text == "plain",
+                      "string content is a single text part");
+
+    ChatTurn text_only;
+    parse_content_parts(Json::array({Json{{"type", "text"}, {"text", "a"}}}), text_only, 0, {"text"});
+    failures +=
+        check(text_only.content.size() == 1 && text_only.content[0].kind == ContentKind::Text,
+              "text allowed by {\"text\"}");
+    failures += check(
+        api_message([&] {
+            ChatTurn t;
+            parse_content_parts(Json::array({Json{{"type", "image_url"},
+                                                {"image_url", Json{{"url", "data:image/png;base64,AA=="}}}}}),
+                                t, 0, {"text"});
+        }) == "message 0 content parts must have type 'text'",
+        "non-text rejected with the allowed type listed");
+
+    ChatTurn multi;
+    parse_content_parts(
+        Json::array(
+            {Json{{"type", "text"}, {"text", "a"}},
+             Json{{"type", "image_url"}, {"image_url", Json{{"url", "data:image/png;base64,AA=="}}}}}),
+        multi, 0, {"text", "image_url"});
+    failures += check(multi.content.size() == 2, "multi-type allowlist parses both listed types");
+    failures += check(multi.content[0].kind == ContentKind::Text, "multi-type text kind");
+    failures += check(multi.content[1].kind == ContentKind::Image, "multi-type image kind");
+    failures += check(
+        api_message([&] {
+            ChatTurn t;
+            parse_content_parts(
+                Json::array({Json{{"type", "video_url"},
+                                  {"video_url", Json{{"url", "https://example.test/clip.mp4"}}}}}),
+                t, 0, {"text", "image_url"});
+        }) == "message 0 content parts must have type 'text', 'image_url'",
+        "multi-type rejection lists the allowed types in caller order");
+
+    ChatTurn rejected;
+    failures += check(
+        throws_api([&] {
+            parse_content_parts(
+                Json::array({Json{{"type", "image_url"},
+                                  {"image_url", Json{{"url", "https://not-a-real-host.test/x"}}}}}),
+                rejected, 0, {"text"});
+        }),
+        "disallowed media part rejected at the schema boundary");
+    failures += check(rejected.content.empty(), "disallowed part is not appended or acquired");
+
+    ChatTurn empty;
+    failures += check(throws_api([&] { parse_content_parts(Json::array(), empty, 0, {"text"}); }),
+                      "empty content array rejected");
+    return failures;
+}
+
 int test_parse_stop_and_max_tokens() {
     int failures          = 0;
     Json body             = {{"model", "m"},
@@ -797,6 +879,7 @@ int main() {
     failures += test_parse_function_tools_and_choices();
     failures += test_parse_tool_history_messages();
     failures += test_parse_tool_message_content_parts();
+    failures += test_parse_content_parts_allowed_types();
     failures += test_parse_stop_and_max_tokens();
     failures += test_parse_sampling_carried();
     failures += test_response_serialization();

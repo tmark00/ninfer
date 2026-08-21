@@ -26,6 +26,8 @@ LoadPlan::LoadPlan(LoadPlan&&) noexcept            = default;
 LoadPlan& LoadPlan::operator=(LoadPlan&&) noexcept = default;
 LoadPlan::~LoadPlan()                              = default;
 
+std::size_t LoadPlan::overlay_staging_bytes() const { return 0; }
+
 const artifact::MaterializationPlan& LoadPlan::materialization() const {
     if (impl_ == nullptr) { throw std::logic_error("target load plan is empty"); }
     return impl_->plan.materialization;
@@ -96,6 +98,7 @@ Package::Frontend Package::make_frontend(const LoadedModel& model, const EngineO
                                       .media_cache_bytes        = options.media_cache_bytes,
                                       .media_live_bytes         = options.media_live_bytes,
                                       .media_preprocess_threads = options.media_preprocess_threads,
+                                      .vision_max_merged_tokens = options.vision_max_merged_tokens,
                                   });
 }
 

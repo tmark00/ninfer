@@ -187,6 +187,7 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
       kv_packed_v(plan.kv_packed_v), kv_rotate_k(plan.kv_rotate_k), kv_rotate_v(plan.kv_rotate_v),
       kv_packed_k(plan.kv_packed_k), kv_e8_lattice(plan.kv_e8_lattice), kv_e8_root(plan.kv_e8_root),
       proposal_head(plan.proposal_head), vision_enabled(plan.features.vision),
+      vision_max_merged(plan.vision_max_merged),
       use_cuda_graph(plan.use_cuda_graph), kv_payload_bytes(plan.persistent.kv_payload_bytes),
       graph_allowance_bytes(plan.graph_allowance_bytes), workspace_plan(plan.workspace),
       persistent(plan.persistent.bytes), workspace_storage(plan.workspace.capacity),
@@ -626,6 +627,29 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
         if (staged.vision_plan) {
             staged.vision = std::make_unique<schedule::VisionPrefillSession>(
                 device, model, work, staged.prompt, *staged.vision_plan, staged.transient);
+            if (model.vision_overlay) {
+                // Exclusive GPU turn: encode the items prefill will actually
+                // consume (spans past the prefix-reuse boundary) through one
+                // overlay window and hand prefill the pinned embeddings.
+                std::size_t first_needed = staged.vision_plan->control->items.size();
+                for (const VisionUseSpan& use : staged.vision_plan->uses) {
+                    if (use.end > base) {
+                        first_needed = std::min<std::size_t>(first_needed, use.item_index);
+                    }
+                }
+                schedule::VisionOverlayWindowStats window_stats{};
+                std::vector<schedule::PinnedVisionResult> preencoded;
+                if (first_needed < staged.vision_plan->control->items.size()) {
+                    preencoded = schedule::encode_items_overlay(
+                        device, model, staged.prompt, *staged.vision_plan, first_needed,
+                        &window_stats);
+                } else {
+                    // Every span is prefix-reused; install null placeholders so the
+                    // session never falls back to host-pointer resident encode.
+                    preencoded.resize(staged.vision_plan->control->items.size());
+                }
+                staged.vision->set_preencoded(std::move(preencoded), window_stats);
+            }
         }
         staged.elapsed_seconds = std::chrono::duration<double>(Clock::now() - started).count();
         request.lifecycle      = Lifecycle::Prefilling;
@@ -1684,6 +1708,14 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
         }
         sequence.tail_hidden_valid      = true;
         request.timings.vision_seconds  = vision_seconds;
+        if (staged.vision && staged.vision->overlay_stats()) {
+            const auto& overlay                     = *staged.vision->overlay_stats();
+            request.timings.overlay_window_seconds  = overlay.window_seconds;
+            request.timings.overlay_evict_seconds   = overlay.evict_seconds;
+            request.timings.overlay_restore_seconds = overlay.restore_seconds;
+            request.timings.overlay_evicted_bytes   = overlay.evicted_bytes;
+            request.timings.overlay_staged_bytes    = overlay.staged_bytes;
+        }
         request.timings.prefill_seconds = std::max(0.0, staged.elapsed_seconds - vision_seconds);
         if (rewrite_checkpoint_capture) {
             const std::uint32_t frontier = rewrite_checkpoint_capture->frontier;

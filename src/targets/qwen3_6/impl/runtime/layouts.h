@@ -76,6 +76,7 @@ struct SequencePlanningInputs {
     bool kv_e8_root                        = false;
     ProposalHead proposal_head             = ProposalHead::Full;
     StartupFeatures features;
+    std::uint32_t vision_max_merged = 32768;
     bool use_cuda_graph = true;
     int device          = 0;
 };
@@ -104,6 +105,7 @@ struct SequencePlanImpl<NINFER_QWEN36_VARIANT> {
     bool kv_e8_root                        = false;
     ProposalHead proposal_head             = ProposalHead::Full;
     StartupFeatures features;
+    std::uint32_t vision_max_merged = 32768;
     bool use_cuda_graph = true;
     int device          = 0;
     NINFER_QWEN36_RUNTIME_NS::PersistentLayout persistent;

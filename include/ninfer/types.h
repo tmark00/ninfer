@@ -76,6 +76,15 @@ struct LoadProgress {
     std::function<void(std::string_view phase, std::uint64_t done, std::uint64_t total)> callback;
 };
 
+enum class VisionResidency : std::uint8_t {
+    // Vision weights stay resident on the device for the process lifetime.
+    Resident,
+    // Vision weights live in pinned host memory and are streamed through device
+    // memory borrowed from evicted read-only text weights for the duration of
+    // each image encode. Requires enable_vision.
+    Overlay,
+};
+
 struct EngineOptions {
     std::filesystem::path artifact_path;
     int device                         = 0;
@@ -92,6 +101,11 @@ struct EngineOptions {
     // Zero selects a bounded worker count from the detected host concurrency.
     std::uint32_t media_preprocess_threads = 0;
     bool enable_vision                     = false;
+    VisionResidency vision_residency       = VisionResidency::Resident;
+    // Largest merged vision-token count a single item may carry. Bounds the
+    // vision share of the startup workspace/transient reservations; smaller
+    // values return the difference to KV capacity.
+    std::uint32_t vision_max_merged_tokens = 32768;
     bool use_cuda_graph                    = true;
     LoadProgress load_progress;
 };
@@ -374,6 +388,13 @@ struct GenerationTimings {
     double prefill_seconds     = 0.0;
     double decode_seconds      = 0.0;
     double total_seconds       = 0.0;
+    // Overlay vision residency: duration and traffic of the encode window that
+    // borrowed device memory from evicted text weights. Zero in resident mode.
+    double overlay_window_seconds  = 0.0;
+    double overlay_evict_seconds   = 0.0;
+    double overlay_restore_seconds = 0.0;
+    std::uint64_t overlay_evicted_bytes = 0;
+    std::uint64_t overlay_staged_bytes  = 0;
 };
 
 struct SpeculativeStats {

@@ -1,3 +1,9 @@
+> **This is a personal fork.** It is an integration branch that combines several unmerged
+> upstream pull requests to run Qwen3.8-27B NVFP4 at 262k context on a 24 GiB RTX 5090 **Laptop**
+> under Windows. It is not a release and not a proposal to upstream — see **[FORK.md](FORK.md)**
+> for what it combines, whose work it carries, and the rules changes have to pass to get in.
+> Upstream is [Neroued/ninfer](https://github.com/Neroued/ninfer).
+
 # NInfer
 
 > Selected checkpoints. Maximum single-GPU inference performance.

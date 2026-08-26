@@ -403,11 +403,15 @@ RenderedChat CompiledChatTemplate::render(const std::vector<ChatMessage>& messag
         reasoning = trim_ascii_whitespace(reasoning);
 
         const bool keep_thinking = preserve_thinking || (static_cast<long>(i) > last_query_index);
-        rendered += "<|im_start|>assistant\n";
         if (!preserve_thinking && !rewrite_checkpoint && static_cast<long>(i) > last_query_index) {
+            // Closing the current turn may rewrite everything beginning with this assistant
+            // segment. Keep the stable history before the opener recoverable; retaining the
+            // deterministic opener itself is not worth losing the whole prefix when a caller
+            // branches with a new user message instead.
             rewrite_checkpoint = RewriteCheckpointByteSpec{
                 .kind = RewriteCheckpointKind::TurnClosure, .offset = rendered.size()};
         }
+        rendered += "<|im_start|>assistant\n";
         if (keep_thinking) {
             rendered += "<think>\n";
             rendered += reasoning;
@@ -429,22 +433,24 @@ RenderedChat CompiledChatTemplate::render(const std::vector<ChatMessage>& messag
     }
 
     if (options.add_generation_prompt) {
-        rendered += "<|im_start|>assistant\n";
-        if (!preserve_thinking && !rewrite_checkpoint) {
+        // The generation suffix is replaceable as a unit. An immediate successor may replay the
+        // response, close the turn, or branch by appending a different user message directly to
+        // the input history. The rolling private checkpoint must therefore precede the assistant
+        // opener; placing it after the deterministic prologue makes the complete history
+        // unrecoverable for the branch case merely to save a handful of prompt tokens.
+        const std::size_t generation_begin = rendered.size();
+        if (preserve_thinking) {
             rewrite_checkpoint = RewriteCheckpointByteSpec{
-                .kind = RewriteCheckpointKind::TurnClosure, .offset = rendered.size()};
+                .kind = RewriteCheckpointKind::ResponseReplay, .offset = generation_begin};
+        } else if (!rewrite_checkpoint) {
+            rewrite_checkpoint = RewriteCheckpointByteSpec{
+                .kind = RewriteCheckpointKind::TurnClosure, .offset = generation_begin};
         }
+        rendered += "<|im_start|>assistant\n";
         if (options.enable_thinking) {
             rendered += "<think>\n";
         } else {
             rendered += "<think>\n\n</think>\n\n";
-        }
-        if (preserve_thinking) {
-            // Response replay retains the deterministic generation prologue. This is the prompt
-            // frontier for both thinking modes, so capturing it does not split off a tiny final
-            // prefill unit. The complete rendered prefix is tokenized independently below.
-            rewrite_checkpoint = RewriteCheckpointByteSpec{
-                .kind = RewriteCheckpointKind::ResponseReplay, .offset = rendered.size()};
         }
     }
     return RenderedChat{.text = std::move(rendered), .rewrite_checkpoint = rewrite_checkpoint};

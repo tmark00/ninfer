@@ -1,6 +1,7 @@
 #pragma once
 
 #include "runtime/contract/request.h"
+#include "core/wide_uint.h"
 #include "core/transfer_work.h"
 #include <array>
 #include <cstddef>
@@ -36,11 +37,13 @@ struct PrefillWork {
     result.tokens                       = suffix_tokens;
     result.vision_items                 = vision_items;
     result.vision_patches               = vision_patches;
-    const unsigned __int128 suffix      = suffix_tokens;
-    const unsigned __int128 linear      = static_cast<unsigned __int128>(prefix_tokens) * suffix;
-    const unsigned __int128 triangular  = suffix * (suffix + 1U) / 2U;
-    constexpr unsigned __int128 maximum = ~static_cast<unsigned __int128>(0);
-    const unsigned __int128 attention =
+    const WideUInt suffix      = suffix_tokens;
+    const WideUInt linear      = static_cast<WideUInt>(prefix_tokens) * suffix;
+    // '>> 1U' rather than '/ 2U': exact for unsigned division by two and available on the
+    // MSVC stand-in, which has no 128-bit division.
+    const WideUInt triangular  = (suffix * (suffix + 1U)) >> 1U;
+    constexpr WideUInt maximum = ~static_cast<WideUInt>(0);
+    const WideUInt attention =
         triangular > maximum - linear ? maximum : linear + triangular;
     result.attention_pairs = attention > std::numeric_limits<std::uint64_t>::max()
                                  ? std::numeric_limits<std::uint64_t>::max()

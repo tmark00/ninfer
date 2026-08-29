@@ -1,0 +1,5 @@
+# The frontend matches its chat template by SHA-256 of the file's bytes, and the serve corpus is
+# compared verbatim, so these fixtures must keep LF whatever core.autocrlf says. Git for Windows
+# ships with core.autocrlf=true at system level, which otherwise checks them out with CRLF and the
+# frontend test dies with "unsupported frontend/chat_template.jinja".
+tests/fixtures/** text eol=lf

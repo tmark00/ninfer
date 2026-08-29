@@ -88,6 +88,17 @@ const fi::CompiledChatTemplate& reasoning_effort_template() {
     return value;
 }
 
+// Four tests below need the upstream maintainer's Hugging Face export, which lives at an
+// absolute path on his machine. Detect it rather than aborting the whole binary: the
+// remaining tests are self-contained and are worth running everywhere.
+bool official_resources_available() {
+    static const bool available = [] {
+        const std::ifstream probe("/home/neroued/models/llm/qwen/Qwen3.6-27B/base-hf-bf16/tokenizer.json");
+        return probe.good();
+    }();
+    return available;
+}
+
 const fi::Tokenizer& official_tokenizer() {
     static const std::string tokenizer_json =
         read_file("/home/neroued/models/llm/qwen/Qwen3.6-27B/base-hf-bf16/tokenizer.json");
@@ -1389,19 +1400,24 @@ int test_split_think_close_dropped(const Frontend& frontend) {
     return failures;
 }
 
-int main() {
+int main() try {
     const FrontendResources owned = resources();
     const Frontend frontend       = FrontendFactory::create_component(owned);
     int failures                  = 0;
-    failures += test_official_tokenizer_merge();
-    failures += test_repeated_special_tokens_scan_linearly();
+    const bool official           = official_resources_available();
+    if (!official) {
+        std::cerr << "skip: no Hugging Face tokenizer export at the hard-coded path; "
+                     "the four tests that need it are not run" << '\n';
+    }
+    failures += official ? test_official_tokenizer_merge() : 0;
+    failures += official ? test_repeated_special_tokens_scan_linearly() : 0;
     failures += test_official_chat_template();
-    failures += test_ordered_instruction_turns();
+    failures += official ? test_ordered_instruction_turns() : 0;
     failures += test_reasoning_effort_chat_template();
     failures += test_rewrite_checkpoint_trace();
     failures += test_official_resource_guards();
     failures += test_text_and_image_prepare(frontend);
-    failures += test_media_admission_uses_aggregate_resources(frontend);
+    failures += official ? test_media_admission_uses_aggregate_resources(frontend) : 0;
     failures += test_multimodal_prompt_over_removed_32k_cap(frontend);
     failures += test_attention_pairs_are_diagnostic(frontend);
     failures += test_video_prepare(frontend);
@@ -1422,4 +1438,9 @@ int main() {
     failures += test_second_think_close_dropped(frontend);
     failures += test_split_think_close_dropped(frontend);
     return failures == 0 ? 0 : 1;
+} catch (const std::exception& error) {
+    // Without this the harness dies through abort() with no output at all, which says
+    // nothing about which construction failed.
+    std::cerr << "test_frontend aborted: " << error.what() << '\n';
+    return 1;
 }

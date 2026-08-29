@@ -1115,6 +1115,59 @@ int test_utf8_and_hidden_eos(const Frontend& frontend) {
     return failures;
 }
 
+int test_malformed_generated_utf8_is_repaired(const Frontend& frontend) {
+    // The stub vocabulary is byte level: token 10 is 0xe4, the lead of a three-byte sequence, and
+    // token 0 is 'x'. A model is free to sample that pair, and before this was repaired the
+    // frontend threw, which surfaced as a 500 and lost the whole generation.
+    int failures = 0;
+
+    auto truncated_prompt  = frontend.prepare_tokens({0});
+    auto truncated_session = frontend.make_output_session(truncated_prompt, {});
+    const auto lead_decision =
+        truncated_session.preview(std::array<ninfer::TokenId, 1>{10}, 4,
+                                  ninfer::FinishReason::OutputLimit);
+    failures += check(lead_decision.accepted_tokens == 1 && !lead_decision.finished(),
+                      "UTF-8 lead byte unexpectedly ended generation");
+    failures += check(truncated_session.commit_preview().empty(),
+                      "incomplete UTF-8 sequence was published before its continuation");
+    const auto ascii_decision =
+        truncated_session.preview(std::array<ninfer::TokenId, 1>{0}, 3,
+                                  ninfer::FinishReason::OutputLimit);
+    failures += check(ascii_decision.accepted_tokens == 1 && !ascii_decision.finished(),
+                      "byte that cannot continue a sequence ended generation");
+    failures +=
+        check(channel_text(truncated_session.commit_preview(), ninfer::OutputChannel::Content) ==
+                  "\xef\xbf\xbdx",
+              "truncated sequence was not replaced, or the text after it was dropped");
+
+    auto stray_prompt  = frontend.prepare_tokens({0});
+    auto stray_session = frontend.make_output_session(stray_prompt, {});
+    const auto stray_decision =
+        stray_session.preview(std::array<ninfer::TokenId, 1>{11}, 4,
+                              ninfer::FinishReason::OutputLimit);
+    failures += check(stray_decision.accepted_tokens == 1 && !stray_decision.finished(),
+                      "stray continuation byte unexpectedly ended generation");
+    failures += check(channel_text(stray_session.commit_preview(),
+                                   ninfer::OutputChannel::Content) == "\xef\xbf\xbd",
+                      "stray continuation byte was not replaced");
+
+    // A well-formed sequence must still survive being split across tokens.
+    auto intact_prompt  = frontend.prepare_tokens({0});
+    auto intact_session = frontend.make_output_session(intact_prompt, {});
+    for (const ninfer::TokenId token : {10, 11}) {
+        (void)intact_session.preview(std::array<ninfer::TokenId, 1>{token}, 4,
+                                     ninfer::FinishReason::OutputLimit);
+        failures += check(intact_session.commit_preview().empty(),
+                          "partial UTF-8 codepoint was published by the repairing decoder");
+    }
+    (void)intact_session.preview(std::array<ninfer::TokenId, 1>{12}, 2,
+                                 ninfer::FinishReason::OutputLimit);
+    failures +=
+        check(channel_text(intact_session.commit_preview(), ninfer::OutputChannel::Content) == "中",
+              "valid UTF-8 codepoint was damaged by the repairing decoder");
+    return failures;
+}
+
 int test_disabled_vision() {
     const Frontend frontend = FrontendFactory::create_component(resources(), false);
     int failures = check(throws_invalid_argument([&] { (void)frontend.prepare(image_input()); }),
@@ -1426,6 +1479,7 @@ int main() try {
     failures += test_terminal_flush(frontend);
     failures += test_reasoning_split(frontend);
     failures += test_utf8_and_hidden_eos(frontend);
+    failures += test_malformed_generated_utf8_is_repaired(frontend);
     failures += test_media_cache_reuses_immutable_payload();
     failures += test_media_payload_outlives_frontend_cache();
     failures += test_media_live_bytes_follow_last_payload_reference();

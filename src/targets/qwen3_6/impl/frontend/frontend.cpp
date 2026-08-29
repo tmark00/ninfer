@@ -35,8 +35,9 @@ using Json   = nlohmann::json;
 using Clock  = std::chrono::steady_clock;
 namespace fi = frontend_internal;
 
-constexpr std::size_t kPatchFeatures   = 1536;
-constexpr std::string_view kThinkClose = "</think>";
+constexpr std::size_t kPatchFeatures        = 1536;
+constexpr std::string_view kThinkClose      = "</think>";
+constexpr std::string_view kUtf8Replacement = "\xef\xbf\xbd";
 constexpr double kRescaleFactor        = 1.0 / 255.0;
 constexpr double kVideoFps             = 2.0;
 constexpr int kVideoMinFrames          = 4;
@@ -383,47 +384,76 @@ void append_delta(PublishedOutput& output, OutputChannel channel, std::string te
     }
 }
 
-std::size_t valid_utf8_prefix_size(std::string_view bytes) {
+// A generated token stream can carry bytes that are not valid UTF-8: byte-level tokens are
+// sampled independently, so nothing makes a sampled run form whole code points. Throwing loses the
+// whole generation and takes the endpoint down with a 500, so repair instead - every maximal
+// invalid subpart becomes U+FFFD, which is what terminalize() already does for an unterminated
+// tail. A genuinely incomplete trailing sequence is still held back, because the next token may
+// complete it.
+std::string consume_generated_utf8(std::string& pending) {
+    std::string decoded;
+    decoded.reserve(pending.size());
     std::size_t offset = 0;
-    while (offset < bytes.size()) {
-        const auto lead         = static_cast<unsigned char>(bytes[offset]);
-        std::size_t length      = 0;
-        std::uint32_t codepoint = 0;
-        std::uint32_t minimum   = 0;
+    while (offset < pending.size()) {
+        const auto lead    = static_cast<unsigned char>(pending[offset]);
+        std::size_t length = 0;
         if (lead <= 0x7fU) {
-            length    = 1;
-            codepoint = lead;
-        } else if (lead >= 0xc2U && lead <= 0xdfU) {
-            length    = 2;
-            codepoint = lead & 0x1fU;
-            minimum   = 0x80U;
+            decoded.push_back(pending[offset]);
+            ++offset;
+            continue;
+        }
+        if (lead >= 0xc2U && lead <= 0xdfU) {
+            length = 2;
         } else if (lead >= 0xe0U && lead <= 0xefU) {
-            length    = 3;
-            codepoint = lead & 0x0fU;
-            minimum   = 0x800U;
+            length = 3;
         } else if (lead >= 0xf0U && lead <= 0xf4U) {
-            length    = 4;
-            codepoint = lead & 0x07U;
-            minimum   = 0x10000U;
+            length = 4;
         } else {
-            throw std::invalid_argument("invalid UTF-8 leading byte in generated token stream");
+            // 0x80-0xc1 and 0xf5-0xff never lead a sequence: a stray continuation byte or an
+            // overlong two-byte form.
+            decoded.append(kUtf8Replacement);
+            ++offset;
+            continue;
         }
-        if (offset + length > bytes.size()) { return offset; }
+
+        bool malformed = false;
         for (std::size_t index = 1; index < length; ++index) {
-            const auto byte = static_cast<unsigned char>(bytes[offset + index]);
-            if ((byte & 0xc0U) != 0x80U) {
-                throw std::invalid_argument(
-                    "invalid UTF-8 continuation byte in generated token stream");
+            if (offset + index >= pending.size()) {
+                pending.erase(0, offset);
+                return decoded;
             }
-            codepoint = (codepoint << 6U) | (byte & 0x3fU);
+            const auto byte       = static_cast<unsigned char>(pending[offset + index]);
+            unsigned char minimum = 0x80U;
+            unsigned char maximum = 0xbfU;
+            if (index == 1) {
+                // Narrowing the first continuation byte is what rejects overlong forms, the
+                // UTF-16 surrogate block and everything above U+10ffff, without recomposing the
+                // code point.
+                if (lead == 0xe0U) {
+                    minimum = 0xa0U;
+                } else if (lead == 0xedU) {
+                    maximum = 0x9fU;
+                } else if (lead == 0xf0U) {
+                    minimum = 0x90U;
+                } else if (lead == 0xf4U) {
+                    maximum = 0x8fU;
+                }
+            }
+            if (byte < minimum || byte > maximum) {
+                // Replace one maximal subpart and resume at the offending byte rather than
+                // consuming it, so text following a bad sequence is still published.
+                decoded.append(kUtf8Replacement);
+                offset += index;
+                malformed = true;
+                break;
+            }
         }
-        if (codepoint < minimum || (codepoint >= 0xd800U && codepoint <= 0xdfffU) ||
-            codepoint > 0x10ffffU) {
-            throw std::invalid_argument("invalid UTF-8 codepoint in generated token stream");
-        }
+        if (malformed) { continue; }
+        decoded.append(pending, offset, length);
         offset += length;
     }
-    return offset;
+    pending.clear();
+    return decoded;
 }
 
 std::size_t longest_suffix_prefix(std::string_view text, std::string_view marker,
@@ -591,10 +621,8 @@ void feed_token_bytes(DecoderState& state, std::string bytes, const StopPolicy& 
                       PublishedOutput& emitted, std::uint32_t committed_tokens,
                       StopMatch* best_match) {
     state.utf8_pending += bytes;
-    const std::size_t valid = valid_utf8_prefix_size(state.utf8_pending);
-    if (valid == 0) { return; }
-    const std::string text = state.utf8_pending.substr(0, valid);
-    state.utf8_pending.erase(0, valid);
+    const std::string text = consume_generated_utf8(state.utf8_pending);
+    if (text.empty()) { return; }
     feed_decoded_text(state, text, policy, emitted, committed_tokens, best_match);
 }
 
@@ -605,7 +633,8 @@ void terminalize(DecoderState& state, const StopPolicy& policy, PublishedOutput&
         // Publish the standard replacement character rather than an invalid
         // UTF-8 suffix; the logical token prefix remains exact.
         state.utf8_pending.clear();
-        feed_decoded_text(state, "\xef\xbf\xbd", policy, emitted, committed_tokens, nullptr);
+        feed_decoded_text(state, std::string(kUtf8Replacement), policy, emitted, committed_tokens,
+                          nullptr);
     }
     if (state.in_reasoning) {
         feed_channel(state, OutputChannel::Reasoning, state.think_marker_pending, policy, emitted,

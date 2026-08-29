@@ -76,6 +76,12 @@ if(MSVC)
   # compiler does not reject them.)
   add_compile_options($<$<COMPILE_LANGUAGE:C,CXX>:/Zc:preprocessor>)
   set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -Xcompiler=/Zc:preprocessor")
+  # The sources are UTF-8 without a BOM. cl otherwise decodes them in the machine's ANSI code
+  # page, which silently rewrites every non-ASCII literal in the tree - on a Polish install the
+  # frontend test's byte-level tokenizer stub came out corrupt and the binary died before it
+  # printed anything. /utf-8 sets both the source and the execution charset.
+  add_compile_options($<$<COMPILE_LANGUAGE:C,CXX>:/utf-8>)
+  set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -Xcompiler=/utf-8")
   # windows.h defines min/max as macros which clobber std::min/std::max; NOMINMAX
   # suppresses them. UTF8PROC_STATIC keeps the vendored utf8proc header from
   # marking its symbols __declspec(dllimport) since we compile it statically. Both

@@ -631,6 +631,13 @@ int test_reasoning_effort_chat_template() {
     return failures;
 }
 
+// Every checkpoint below is anchored *before* the assistant opener rather than after the
+// deterministic generation prologue. That moved in ab3d2154: a checkpoint placed after the
+// opener sits inside the very suffix a successor request replaces, so closing a tool loop or
+// branching with a new user message discarded the whole conversation prefix and re-prefilled
+// from zero. Anchoring before the opener costs a handful of re-rendered prompt tokens per
+// continuation and keeps the stable prefix; it was measured at -67% TTFT per request. The
+// assertions here therefore expect the opener offset itself, not opener + header size.
 int test_rewrite_checkpoint_trace() {
     const std::string assistant_header = "<|im_start|>assistant\n";
     fi::ChatMessage first              = chat_message(ninfer::ChatRole::Assistant, "");
@@ -650,8 +657,8 @@ int test_rewrite_checkpoint_trace() {
         check(first_header != std::string::npos && open.rewrite_checkpoint &&
                   open.rewrite_checkpoint->kind ==
                       ninfer::targets::qwen3_6::RewriteCheckpointKind::TurnClosure &&
-                  open.rewrite_checkpoint->offset == first_header + assistant_header.size(),
-              "tool loop did not retain its first assistant turn-closure boundary");
+                  open.rewrite_checkpoint->offset == first_header,
+              "tool loop did not anchor its first assistant turn-closure boundary");
 
     fi::ChatRenderOptions preserve;
     preserve.preserve_thinking         = true;
@@ -660,19 +667,21 @@ int test_rewrite_checkpoint_trace() {
     failures += check(preserved_header != std::string::npos && preserved.rewrite_checkpoint &&
                           preserved.rewrite_checkpoint->kind ==
                               ninfer::targets::qwen3_6::RewriteCheckpointKind::ResponseReplay &&
-                          preserved.rewrite_checkpoint->offset == preserved.text.size() &&
+                          preserved.rewrite_checkpoint->offset == preserved_header &&
                           preserved.text.ends_with("<think>\n"),
-                      "preserve_thinking did not publish the complete generation prologue");
+                      "preserve_thinking did not anchor the response replay before its "
+                      "generation opener");
 
-    preserve.enable_thinking           = false;
-    const fi::RenderedChat nonthinking = render_chat(tool_loop, preserve);
-    failures += check(nonthinking.rewrite_checkpoint &&
+    preserve.enable_thinking             = false;
+    const fi::RenderedChat nonthinking   = render_chat(tool_loop, preserve);
+    const std::size_t nonthinking_header = nonthinking.text.rfind(assistant_header);
+    failures += check(nonthinking_header != std::string::npos && nonthinking.rewrite_checkpoint &&
                           nonthinking.rewrite_checkpoint->kind ==
                               ninfer::targets::qwen3_6::RewriteCheckpointKind::ResponseReplay &&
-                          nonthinking.rewrite_checkpoint->offset == nonthinking.text.size() &&
+                          nonthinking.rewrite_checkpoint->offset == nonthinking_header &&
                           nonthinking.text.ends_with("<think>\n\n</think>\n\n"),
-                      "non-thinking response replay did not retain its complete generation "
-                      "prologue");
+                      "non-thinking response replay did not anchor before its generation "
+                      "opener");
 
     std::vector<fi::ChatMessage> next_turn = tool_loop;
     next_turn.push_back(chat_message(ninfer::ChatRole::User, "next question"));
@@ -681,7 +690,7 @@ int test_rewrite_checkpoint_trace() {
     failures += check(final_header != std::string::npos && next.rewrite_checkpoint &&
                           next.rewrite_checkpoint->kind ==
                               ninfer::targets::qwen3_6::RewriteCheckpointKind::TurnClosure &&
-                          next.rewrite_checkpoint->offset == final_header + assistant_header.size(),
+                          next.rewrite_checkpoint->offset == final_header,
                       "new user turn did not move the rewrite boundary to its generation opener");
 
     fi::ChatRenderOptions no_generation;
@@ -707,7 +716,7 @@ int test_rewrite_checkpoint_trace() {
         check(wrapped.rewrite_checkpoint &&
                   wrapped.rewrite_checkpoint->kind ==
                       ninfer::targets::qwen3_6::RewriteCheckpointKind::TurnClosure &&
-                  wrapped.rewrite_checkpoint->offset == wrapped_first + assistant_header.size(),
+                  wrapped.rewrite_checkpoint->offset == wrapped_first,
               "bare tool-response wrapper incorrectly advanced the real user turn");
     return failures;
 }
@@ -761,7 +770,10 @@ int test_text_and_image_prepare(const Frontend& frontend) {
     failures += check(text_data.identity.rewrite_checkpoint &&
                           text_data.identity.rewrite_checkpoint->kind ==
                               ninfer::targets::qwen3_6::RewriteCheckpointKind::TurnClosure &&
-                          text_data.identity.rewrite_checkpoint->frontier == 7 &&
+                          // Token 5 is the <|im_start|> of the generation opener; 6 and 7 are
+                          // "assistant\n" and <think>. ab3d2154 anchors the checkpoint before
+                          // the opener, so the frontier is 5 rather than the former 7.
+                          text_data.identity.rewrite_checkpoint->frontier == 5 &&
                           text_data.starts_in_reasoning && !text_data.has_media(),
                       "text frontend did not preserve prefix/thinking identity");
     failures +=
@@ -781,10 +793,9 @@ int test_text_and_image_prepare(const Frontend& frontend) {
     failures += check(preserved_data.identity.rewrite_checkpoint &&
                           preserved_data.identity.rewrite_checkpoint->kind ==
                               ninfer::targets::qwen3_6::RewriteCheckpointKind::ResponseReplay &&
-                          preserved_data.identity.rewrite_checkpoint->frontier ==
-                              preserved_data.token_ids.size(),
-                      "preserve-thinking prompt did not publish a prompt-frontier response "
-                      "checkpoint");
+                          preserved_data.identity.rewrite_checkpoint->frontier == 5,
+                      "preserve-thinking prompt did not anchor its response checkpoint before "
+                      "the generation opener");
 
     ninfer::ChatMessage nonthinking_message;
     nonthinking_message.role = ninfer::ChatRole::User;
@@ -796,13 +807,18 @@ int test_text_and_image_prepare(const Frontend& frontend) {
     nonthinking_input.options.enable_thinking   = false;
     const auto nonthinking_prompt               = frontend.prepare(std::move(nonthinking_input));
     const auto& nonthinking_data                = FrontendFactory::inspect(nonthinking_prompt);
+    // The non-thinking prologue is longer than the thinking one (<think>\n\n</think>\n\n rather
+    // than <think>\n), so this prompt has more tokens than the one above while its checkpoint
+    // sits at the same offset: anchoring before the opener makes the frontier independent of
+    // which prologue the render appends.
     failures += check(nonthinking_data.identity.rewrite_checkpoint &&
                           nonthinking_data.identity.rewrite_checkpoint->kind ==
                               ninfer::targets::qwen3_6::RewriteCheckpointKind::ResponseReplay &&
-                          nonthinking_data.identity.rewrite_checkpoint->frontier ==
-                              nonthinking_data.token_ids.size() &&
+                          nonthinking_data.token_ids.size() > preserved_data.token_ids.size() &&
+                          nonthinking_data.identity.rewrite_checkpoint->frontier == 5 &&
                           !nonthinking_data.starts_in_reasoning,
-                      "non-thinking prompt did not publish a prompt-frontier response checkpoint");
+                      "non-thinking prompt did not anchor its response checkpoint before the "
+                      "generation opener");
 
     ninfer::MessagePart image;
     image.kind              = ninfer::MessagePartKind::Media;
@@ -1388,7 +1404,11 @@ int test_stray_think_close_dropped(const Frontend& frontend) {
     int failures        = check(decision.accepted_tokens == 2,
                                 "stray-close session did not accept both tokens");
     const auto output   = session.commit_preview();
-    failures += check(channel_text(output, ninfer::OutputChannel::Content) == "answer",
+    // The marker is removed; the text around it is not. Text already handed to the client
+    // cannot be retracted once a later token reveals a close marker - the split-marker case
+    // below publishes "thought" a whole round before the marker resolves - so "drop the
+    // marker" is the only rule that does not depend on where round boundaries happen to fall.
+    failures += check(channel_text(output, ninfer::OutputChannel::Content) == "thought\n\nanswer",
                       "stray think-close with thinking-off leaked into content");
     return failures;
 }
@@ -1414,7 +1434,11 @@ int test_second_think_close_dropped(const Frontend& frontend) {
     const auto output   = session.commit_preview();
     failures += check(channel_text(output, ninfer::OutputChannel::Reasoning) == "thought",
                       "reasoning channel text changed by stray-close handling");
-    failures += check(channel_text(output, ninfer::OutputChannel::Content) == "answeranswer",
+    // "answer" from the genuine close (its separator stripped), then the second round's
+    // "thought", its stray marker removed, and its separator kept: only the first close
+    // arms the separator strip, because only it ends a reasoning span.
+    failures += check(channel_text(output, ninfer::OutputChannel::Content) ==
+                          "answerthought\n\nanswer",
                       "second think-close leaked into content");
     return failures;
 }
@@ -1433,8 +1457,10 @@ int test_split_think_close_dropped(const Frontend& frontend) {
     input.options.enable_thinking       = false;
     auto prompt                         = frontend.prepare(std::move(input));
     auto session                        = frontend.make_output_session(prompt, {});
-    // Two separate preview rounds force the marker to span calls.
-    const auto d1 = session.preview(std::array<ninfer::TokenId, 1>{3}, 1,
+    // Two separate preview rounds force the marker to span calls. The budget passed to the
+    // first round is what remains for the whole session, not for that round: passing 1 here
+    // makes round one exhaust the budget, terminalize, and leave round two nothing to do.
+    const auto d1 = session.preview(std::array<ninfer::TokenId, 1>{3}, 2,
                                     ninfer::FinishReason::OutputLimit);
     int failures = check(d1.accepted_tokens == 1, "split round one rejected");
     const auto out1 = session.commit_preview();

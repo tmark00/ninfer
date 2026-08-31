@@ -564,17 +564,24 @@ void feed_content(DecoderState& state, std::string text, const StopPolicy& polic
 void feed_decoded_text(DecoderState& state, std::string_view text, const StopPolicy& policy,
                        PublishedOutput& emitted, std::uint32_t committed_tokens,
                        StopMatch* best_match) {
-    if (!state.in_reasoning && !state.raw_output) {
+    if (state.raw_output) {
+        // Raw sessions expose the stream byte for byte: no reasoning split and no marker
+        // cleanup. They still belong on the content channel - a raw session never enters
+        // reasoning, so falling through to the marker scan below would publish the entire
+        // raw stream as reasoning instead.
+        feed_content(state, std::string(text), policy, emitted, committed_tokens, best_match);
+        return;
+    }
+
+    if (!state.in_reasoning) {
         // With preserve_special_tokens enabled (tool-capable requests), a model-emitted
         // think-close token decodes to literal text. Once reasoning has closed - or never
         // opened (thinking disabled) - that tag can never be meaningful content, so drop
         // it instead of leaking the raw marker into client-visible text. The first close
         // while reasoning is still open is handled above; this guards every subsequent one.
         // A marker split across decoded tokens is handled by holding the ambiguous tail in
-        // think_marker_pending until it resolves. Raw sessions bypass reasoning handling by
-        // design and keep every byte, so the cleanup does not apply there.
+        // think_marker_pending until it resolves.
         state.think_marker_pending.append(text);
-        const std::size_t hit = state.think_marker_pending.find(kThinkClose);
         const std::size_t hold =
             longest_suffix_prefix(state.think_marker_pending, kThinkClose, true);
         const std::size_t resolved_end = state.think_marker_pending.size() - hold;
@@ -717,7 +724,6 @@ public:
     std::shared_ptr<const fi::Tokenizer> tokenizer;
     StopPolicy policy;
     bool preserve_special = false;
-    bool raw_output       = false;
     DecoderState state;
     DecoderState preview_state;
     PublishedOutput preview_output;

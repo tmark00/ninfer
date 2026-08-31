@@ -4,6 +4,9 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#ifdef _MSC_VER
+#include <malloc.h>
+#endif
 #include <iostream>
 #include <memory>
 #include <stdexcept>
@@ -11,12 +14,24 @@
 
 namespace {
 
-using AlignedBacking = std::unique_ptr<void, decltype(&std::free)>;
+#ifdef _MSC_VER
+void* aligned_allocate(std::size_t alignment, std::size_t bytes) {
+    return _aligned_malloc(bytes, alignment);
+}
+void aligned_release(void* data) noexcept { _aligned_free(data); }
+#else
+void* aligned_allocate(std::size_t alignment, std::size_t bytes) {
+    return std::aligned_alloc(alignment, bytes);
+}
+void aligned_release(void* data) noexcept { std::free(data); }
+#endif
+
+using AlignedBacking = std::unique_ptr<void, decltype(&aligned_release)>;
 
 AlignedBacking make_backing(std::size_t bytes) {
-    void* data = std::aligned_alloc(256, bytes);
+    void* data = aligned_allocate(256, bytes);
     if (data == nullptr) { throw std::bad_alloc(); }
-    return AlignedBacking(data, &std::free);
+    return AlignedBacking(data, &aligned_release);
 }
 
 int fail(const char* label) {

@@ -133,7 +133,13 @@ NInfer currently requires:
 - CMake 3.28 or newer and a C++20-capable host compiler;
 - `pkg-config`;
 - FFmpeg development libraries: `libavformat >= 60`, `libavcodec >= 60`,
-  `libavutil >= 58`, and `libswscale >= 7`;
+  `libavutil >= 58`, and `libswscale >= 7`, **built with zlib**. FFmpeg gates its PNG
+  decoder on zlib (`png_decoder_deps="zlib"`), so an FFmpeg without it decodes JPEG,
+  BMP, WebP, TIFF and GIF but fails every PNG with `media codec is not supported`.
+  On the Windows build of this fork that means the vcpkg port needs its `zlib` feature:
+  `vcpkg install "ffmpeg[core,avcodec,avdevice,avfilter,avformat,swresample,swscale,zlib]:x64-windows"`.
+  To check an existing build, load `avcodec-*.dll` and walk `av_codec_iterate` — the
+  featureless port ships 477 decoders and no `png`, the zlib one ships 499 with it;
 - `libcurl >= 7.85`;
 - Ninja, when using the commands below.
 

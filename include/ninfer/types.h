@@ -32,6 +32,27 @@ enum class KvCacheStorage : std::uint8_t {
     RK2V4E8,
 };
 
+// Label for one storage mode, as reported by the CLI summary, the bench reports and the request
+// log. Every enumerator that parse_kv_dtype accepts has a spelling here; Int8Group64 keeps its
+// historical "int8-group64" label rather than the "int8" flag spelling.
+[[nodiscard]] inline constexpr const char* kv_cache_storage_name(KvCacheStorage storage) noexcept {
+    switch (storage) {
+    case KvCacheStorage::BFloat16:
+        return "bf16";
+    case KvCacheStorage::Int8Group64:
+        return "int8-group64";
+    case KvCacheStorage::RotatedInt8KeyInt4ValueGroup64:
+        return "rk8v4";
+    case KvCacheStorage::RotatedInt4KeyInt4ValueGroup64:
+        return "rk4v4";
+    case KvCacheStorage::RK4V4E8:
+        return "rk4v4-e8";
+    case KvCacheStorage::RK2V4E8:
+        return "rk2v4-e8";
+    }
+    return "unknown";
+}
+
 enum class KvCapacityMode : std::uint8_t {
     Explicit,
     Automatic,

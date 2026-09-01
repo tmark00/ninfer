@@ -33,3 +33,17 @@ set_target_properties(ninfer_kv_e8_verify PROPERTIES
 # 1M tokens x 256 dims FP32 keys is ~1 GB on-device; keep a host buffer
 # fallback friendly on small systems.
 add_test(NAME ninfer_kv_e8_verify COMMAND ninfer_kv_e8_verify 1000000)
+
+# The decode tables are generated data; this walks every code pair against the arithmetic they
+# were generated from. Needs the codec header, so it reaches into src/ and include/.
+add_executable(ninfer_kv_e8_decode_tables verify_decode_tables.cu)
+
+target_include_directories(ninfer_kv_e8_decode_tables PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/../../src
+  ${CMAKE_CURRENT_SOURCE_DIR}/../../include)
+
+set_target_properties(ninfer_kv_e8_decode_tables PROPERTIES
+  CUDA_STANDARD 17
+  CUDA_STANDARD_REQUIRED ON)
+
+add_test(NAME ninfer_kv_e8_decode_tables COMMAND ninfer_kv_e8_decode_tables)

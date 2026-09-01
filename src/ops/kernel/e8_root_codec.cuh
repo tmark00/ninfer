@@ -384,46 +384,6 @@ __device__ __forceinline__ void e8_encode_root_2stage_8d(
     e8_encode_cylinder_8d(rot, 1.0f, out_code1, out_code2);
 }
 
-// 16-entry Hyperoctahedral Axis Constant Table (128 bytes in __constant__ memory)
-__constant__ const std::uint64_t c_axis_i8x8[16] = {
-    0x0000000000000001ULL, // +e0 (dim 0, +1)
-    0x00000000000000ffULL, // -e0 (dim 0, -1)
-    0x0000000000000100ULL, // +e1 (dim 1, +1)
-    0x000000000000ff00ULL, // -e1 (dim 1, -1)
-    0x0000000000010000ULL, // +e2 (dim 2, +1)
-    0x0000000000ff0000ULL, // -e2 (dim 2, -1)
-    0x0000000001000000ULL, // +e3 (dim 3, +1)
-    0x00000000ff000000ULL, // -e3 (dim 3, -1)
-    0x0000000100000000ULL, // +e4 (dim 4, +1)
-    0x000000ff00000000ULL, // -e4 (dim 4, -1)
-    0x0000010000000000ULL, // +e5 (dim 5, +1)
-    0x0000ff0000000000ULL, // -e5 (dim 5, -1)
-    0x0001000000000000ULL, // +e6 (dim 6, +1)
-    0x00ff000000000000ULL, // -e6 (dim 6, -1)
-    0x0100000000000000ULL, // +e7 (dim 7, +1)
-    0xff00000000000000ULL  // -e7 (dim 7, -1)
-};
-
-// 4-bit Log-Radius Scale Multiplier Table (16 floats, centered at 0.5000 = sqrt(8)/sqrt(32))
-__constant__ const float c_radius_scale[16] = {
-    0.0000f, // idx 0: Zero vector
-    0.0992f, // idx 1: 0.5 * 2^(-7/3)
-    0.1250f, // idx 2: 0.5 * 2^(-6/3)
-    0.1575f, // idx 3: 0.5 * 2^(-5/3)
-    0.1984f, // idx 4: 0.5 * 2^(-4/3)
-    0.2500f, // idx 5: 0.5 * 2^(-3/3)
-    0.3150f, // idx 6: 0.5 * 2^(-2/3)
-    0.3969f, // idx 7: 0.5 * 2^(-1/3)
-    0.5000f, // idx 8: 0.5 * 2^(0)  <-- Exact sqrt(8)/sqrt(32) center
-    0.6300f, // idx 9: 0.5 * 2^(1/3)
-    0.7937f, // idx 10: 0.5 * 2^(2/3)
-    1.0000f, // idx 11: 0.5 * 2^(3/3)
-    1.2599f, // idx 12: 0.5 * 2^(4/3)
-    1.5874f, // idx 13: 0.5 * 2^(5/3)
-    2.0000f, // idx 14: 0.5 * 2^(6/3)
-    2.5198f  // idx 15: 0.5 * 2^(7/3)
-};
-
 // Precomputed 2-Stage E8 Root Tables (2 KiB in __device__ memory, routed through non-blocking L1 cache via __ldg)
 __device__ const std::uint64_t c_e8_stage1_i8x8[256] = {
     0x000000000000fcfcULL, // code 0
@@ -684,19 +644,98 @@ __device__ const std::uint64_t c_e8_stage1_i8x8[256] = {
     0x0000000000000000ULL, // code 255
 };
 
-// 1-Cycle Hardware SIMD Decode using Constant Cache, PTX vadd4, and Radius Scaling
-__device__ __forceinline__ void e8_root_decode_8d_fast(uint8_t root_code, uint8_t rad_axis_code, int8_t out[8]) {
-    const uint32_t rad_idx  = rad_axis_code >> 4;
-    const uint32_t axis_idx = rad_axis_code & 0x0F;
 
-    if (rad_idx == 0) {
-        *reinterpret_cast<uint64_t*>(out) = 0ULL;
-        return;
-    }
+// Device copies of the two tables the reference decode reads with a per-thread index.
+__device__ const std::uint64_t c_e8_axis_i8x8[16] = {
+    0x0000000000000001ULL, 0x00000000000000ffULL, 0x0000000000000100ULL, 0x000000000000ff00ULL,
+    0x0000000000010000ULL, 0x0000000000ff0000ULL, 0x0000000001000000ULL, 0x00000000ff000000ULL,
+    0x0000000100000000ULL, 0x000000ff00000000ULL, 0x0000010000000000ULL, 0x0000ff0000000000ULL,
+    0x0001000000000000ULL, 0x00ff000000000000ULL, 0x0100000000000000ULL, 0xff00000000000000ULL,
+};
 
-    const uint64_t w_root = __ldg(&c_e8_stage1_i8x8[root_code]);
-    const uint64_t w_axis = c_axis_i8x8[axis_idx];
+__device__ const float c_e8_radius_scale[16] = {
+    0.0000f, 0.0992f, 0.1250f, 0.1575f, 0.1984f, 0.2500f, 0.3150f, 0.3969f,
+    0.5000f, 0.6300f, 0.7937f, 1.0000f, 1.2599f, 1.5874f, 2.0000f, 2.5198f,
+};
 
+__device__ const std::uint32_t c_e8_stage1_nib[256] = {
+    0x22222200u, 0x22222240u, 0x22222204u, 0x22222244u, 0x22222020u, 0x22222420u, 0x22222024u, 0x22222424u,
+    0x22220220u, 0x22224220u, 0x22220224u, 0x22224224u, 0x22202220u, 0x22242220u, 0x22202224u, 0x22242224u,
+    0x22022220u, 0x22422220u, 0x22022224u, 0x22422224u, 0x20222220u, 0x24222220u, 0x20222224u, 0x24222224u,
+    0x02222220u, 0x42222220u, 0x02222224u, 0x42222224u, 0x22222002u, 0x22222402u, 0x22222042u, 0x22222442u,
+    0x22220202u, 0x22224202u, 0x22220242u, 0x22224242u, 0x22202202u, 0x22242202u, 0x22202242u, 0x22242242u,
+    0x22022202u, 0x22422202u, 0x22022242u, 0x22422242u, 0x20222202u, 0x24222202u, 0x20222242u, 0x24222242u,
+    0x02222202u, 0x42222202u, 0x02222242u, 0x42222242u, 0x22220022u, 0x22224022u, 0x22220422u, 0x22224422u,
+    0x22202022u, 0x22242022u, 0x22202422u, 0x22242422u, 0x22022022u, 0x22422022u, 0x22022422u, 0x22422422u,
+    0x20222022u, 0x24222022u, 0x20222422u, 0x24222422u, 0x02222022u, 0x42222022u, 0x02222422u, 0x42222422u,
+    0x22200222u, 0x22240222u, 0x22204222u, 0x22244222u, 0x22020222u, 0x22420222u, 0x22024222u, 0x22424222u,
+    0x20220222u, 0x24220222u, 0x20224222u, 0x24224222u, 0x02220222u, 0x42220222u, 0x02224222u, 0x42224222u,
+    0x22002222u, 0x22402222u, 0x22042222u, 0x22442222u, 0x20202222u, 0x24202222u, 0x20242222u, 0x24242222u,
+    0x02202222u, 0x42202222u, 0x02242222u, 0x42242222u, 0x20022222u, 0x24022222u, 0x20422222u, 0x24422222u,
+    0x02022222u, 0x42022222u, 0x02422222u, 0x42422222u, 0x00222222u, 0x40222222u, 0x04222222u, 0x44222222u,
+    0x11111111u, 0x31111113u, 0x31111131u, 0x11111133u, 0x31111311u, 0x11111313u, 0x11111331u, 0x31111333u,
+    0x31113111u, 0x11113113u, 0x11113131u, 0x31113133u, 0x11113311u, 0x31113313u, 0x31113331u, 0x11113333u,
+    0x31131111u, 0x11131113u, 0x11131131u, 0x31131133u, 0x11131311u, 0x31131313u, 0x31131331u, 0x11131333u,
+    0x11133111u, 0x31133113u, 0x31133131u, 0x11133133u, 0x31133311u, 0x11133313u, 0x11133331u, 0x31133333u,
+    0x31311111u, 0x11311113u, 0x11311131u, 0x31311133u, 0x11311311u, 0x31311313u, 0x31311331u, 0x11311333u,
+    0x11313111u, 0x31313113u, 0x31313131u, 0x11313133u, 0x31313311u, 0x11313313u, 0x11313331u, 0x31313333u,
+    0x11331111u, 0x31331113u, 0x31331131u, 0x11331133u, 0x31331311u, 0x11331313u, 0x11331331u, 0x31331333u,
+    0x31333111u, 0x11333113u, 0x11333131u, 0x31333133u, 0x11333311u, 0x31333313u, 0x31333331u, 0x11333333u,
+    0x33111111u, 0x13111113u, 0x13111131u, 0x33111133u, 0x13111311u, 0x33111313u, 0x33111331u, 0x13111333u,
+    0x13113111u, 0x33113113u, 0x33113131u, 0x13113133u, 0x33113311u, 0x13113313u, 0x13113331u, 0x33113333u,
+    0x13131111u, 0x33131113u, 0x33131131u, 0x13131133u, 0x33131311u, 0x13131313u, 0x13131331u, 0x33131333u,
+    0x33133111u, 0x13133113u, 0x13133131u, 0x33133133u, 0x13133311u, 0x33133313u, 0x33133331u, 0x13133333u,
+    0x13311111u, 0x33311113u, 0x33311131u, 0x13311133u, 0x33311311u, 0x13311313u, 0x13311331u, 0x33311333u,
+    0x33313111u, 0x13313113u, 0x13313131u, 0x33313133u, 0x13313311u, 0x33313313u, 0x33313331u, 0x13313333u,
+    0x33331111u, 0x13331113u, 0x13331131u, 0x33331133u, 0x13331311u, 0x33331313u, 0x33331331u, 0x13331333u,
+    0x13333111u, 0x33333113u, 0x33333131u, 0x13333133u, 0x33333311u, 0x13333313u, 0x13333331u, 0x33333333u,
+    0x22222222u, 0x22222222u, 0x22222222u, 0x22222222u, 0x22222222u, 0x22222222u, 0x22222222u, 0x22222222u,
+    0x22222222u, 0x22222222u, 0x22222222u, 0x22222222u, 0x22222222u, 0x22222222u, 0x22222222u, 0x22222222u,
+};
+
+__device__ const std::uint64_t c_e8_rad_even_i8[16] = {
+    0x0000000000000000ULL, // rad 0: 0 0 0 0 0
+    0x0000000000000000ULL, // rad 1: 0 0 0 0 0
+    0x0000000000000000ULL, // rad 2: 0 0 0 0 0
+    0x00000001000000ffULL, // rad 3: -1 0 0 0 1
+    0x00000001000000ffULL, // rad 4: -1 0 0 0 1
+    0x00000001000000ffULL, // rad 5: -1 0 0 0 1
+    0x000000010100ffffULL, // rad 6: -1 -1 0 1 1
+    0x000000020100fffeULL, // rad 7: -2 -1 0 1 2
+    0x000000020100fffeULL, // rad 8: -2 -1 0 1 2
+    0x000000030100fffdULL, // rad 9: -3 -1 0 1 3
+    0x000000030200fefdULL, // rad 10: -3 -2 0 2 3
+    0x000000040200fefcULL, // rad 11: -4 -2 0 2 4
+    0x000000050300fdfbULL, // rad 12: -5 -3 0 3 5
+    0x000000060300fdfaULL, // rad 13: -6 -3 0 3 6
+    0x000000080400fcf8ULL, // rad 14: -8 -4 0 4 8
+    0x0000000a0500fbf6ULL, // rad 15: -10 -5 0 5 10
+};
+
+__device__ const std::uint64_t c_e8_rad_odd_i8[16] = {
+    0x0000000000000000ULL, // rad 0: 0 0 0 0 0 0
+    0x0000000000000000ULL, // rad 1: 0 0 0 0 0 0
+    0x00000100000000ffULL, // rad 2: -1 0 0 0 0 1
+    0x00000100000000ffULL, // rad 3: -1 0 0 0 0 1
+    0x000001010000ffffULL, // rad 4: -1 -1 0 0 1 1
+    0x000001010000ffffULL, // rad 5: -1 -1 0 0 1 1
+    0x000002010000fffeULL, // rad 6: -2 -1 0 0 1 2
+    0x000002010000fffeULL, // rad 7: -2 -1 0 0 1 2
+    0x000002020000fefeULL, // rad 8: -2 -2 0 0 2 2
+    0x0000030201fffefdULL, // rad 9: -3 -2 -1 1 2 3
+    0x0000040201fffefcULL, // rad 10: -4 -2 -1 1 2 4
+    0x0000050301fffdfbULL, // rad 11: -5 -3 -1 1 3 5
+    0x0000060401fffcfaULL, // rad 12: -6 -4 -1 1 4 6
+    0x0000080502fefbf8ULL, // rad 13: -8 -5 -2 2 5 8
+    0x00000a0602fefaf6ULL, // rad 14: -10 -6 -2 2 6 10
+    0x00000d0803fdf8f3ULL, // rad 15: -13 -8 -3 3 8 13
+};
+
+// Saturating SIMD add of the root and axis lanes, then one float multiply and round per lane.
+// Note that vadd4 is not a hardware instruction on this architecture: ptxas expands each one into
+// a PRMT/LOP3/IADD3 sequence, which is a large part of why the table decode below is faster.
+__device__ __forceinline__ void e8_root_scale_lanes(std::uint64_t w_root, std::uint64_t w_axis,
+                                                    float scale, int8_t out[8]) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
     uint32_t dir_lo, dir_hi;
     asm("vadd4.s32.s32.s32.sat %0, %1, %2, %3;"
@@ -706,7 +745,6 @@ __device__ __forceinline__ void e8_root_decode_8d_fast(uint8_t root_code, uint8_
         : "=r"(dir_hi)
         : "r"(static_cast<uint32_t>(w_root >> 32)), "r"(static_cast<uint32_t>(w_axis >> 32)), "r"(0));
 
-    const float scale = c_radius_scale[rad_idx];
     const int8_t* p_lo = reinterpret_cast<const int8_t*>(&dir_lo);
     const int8_t* p_hi = reinterpret_cast<const int8_t*>(&dir_hi);
 
@@ -716,7 +754,6 @@ __device__ __forceinline__ void e8_root_decode_8d_fast(uint8_t root_code, uint8_
         out[4 + i] = static_cast<int8_t>(__float2int_rn(static_cast<float>(p_hi[i]) * scale));
     }
 #else
-    const float scale = c_radius_scale[rad_idx];
     const int8_t* r = reinterpret_cast<const int8_t*>(&w_root);
     const int8_t* a = reinterpret_cast<const int8_t*>(&w_axis);
     #pragma unroll
@@ -724,6 +761,71 @@ __device__ __forceinline__ void e8_root_decode_8d_fast(uint8_t root_code, uint8_
         out[i] = static_cast<int8_t>(__float2int_rn(static_cast<float>(r[i] + a[i]) * scale));
     }
 #endif
+}
+
+// Reference decode: the arithmetic definition of a decoded lane, round(lane * scale). Not the
+// shipped path -- it exists so tools/test_kv/verify_decode_tables.cu can check the generated
+// tables below against it for every code pair.
+__device__ __forceinline__ void e8_root_decode_8d_reference(uint8_t root_code,
+                                                            uint8_t rad_axis_code,
+                                                            int8_t out[8]) {
+    const uint32_t rad_idx  = rad_axis_code >> 4;
+    const uint32_t axis_idx = rad_axis_code & 0x0F;
+
+    if (rad_idx == 0) {
+        *reinterpret_cast<uint64_t*>(out) = 0ULL;
+        return;
+    }
+
+    const uint64_t w_root = __ldg(&c_e8_stage1_i8x8[root_code]);
+    const uint64_t w_axis = __ldg(&c_e8_axis_i8x8[axis_idx]);
+    const float scale     = __ldg(&c_e8_radius_scale[rad_idx]);
+
+    e8_root_scale_lanes(w_root, w_axis, scale, out);
+}
+
+// The shipped decode: no float and no per-lane arithmetic. Every decoded lane is round(arg * scale) over a
+// tiny argument alphabet, so it is a table read. Root lanes are {-4,-2,0,2,4}; the axis vector
+// adds +-1 to exactly one lane, which is the only lane with an odd argument. c_e8_stage1_nib
+// carries the root lane index k = lane/2 + 2 as eight nibbles, so one PRMT gathers four decoded
+// lanes out of the per-radius even table, and the axis lane is patched from the odd table at
+// index k + (sign > 0). Output is bit-identical to the reference for all 65536 code pairs; the
+// rad_idx == 0 branch is gone because a zero radius reads all-zero table entries anyway.
+__device__ __forceinline__ void e8_root_decode_8d_lut(uint8_t root_code,
+                                                      uint8_t rad_axis_code,
+                                                      int8_t out[8]) {
+    const uint32_t rad_idx  = rad_axis_code >> 4;
+    const uint32_t axis_idx = rad_axis_code & 0x0F;
+
+    const uint32_t nib   = __ldg(&c_e8_stage1_nib[root_code]);
+    const uint64_t even  = __ldg(&c_e8_rad_even_i8[rad_idx]);
+    const uint32_t ev_lo = static_cast<uint32_t>(even);
+    const uint32_t ev_hi = static_cast<uint32_t>(even >> 32);
+
+    uint32_t lo = __byte_perm(ev_lo, ev_hi, nib);
+    uint32_t hi = __byte_perm(ev_lo, ev_hi, nib >> 16);
+
+    const uint32_t dim  = axis_idx >> 1;
+    const uint32_t k    = (nib >> (4u * dim)) & 0xFu;
+    const uint32_t j    = k + ((axis_idx & 1u) ^ 1u);
+    const uint64_t odd  = __ldg(&c_e8_rad_odd_i8[rad_idx]);
+    const uint32_t lane = static_cast<uint32_t>(odd >> (8u * j)) & 0xFFu;
+
+    const uint32_t shift = 8u * (dim & 3u);
+    const uint32_t keep  = ~(0xFFu << shift);
+    const uint32_t patch = lane << shift;
+    if (dim < 4u) {
+        lo = (lo & keep) | patch;
+    } else {
+        hi = (hi & keep) | patch;
+    }
+
+    *reinterpret_cast<uint64_t*>(out) =
+        static_cast<uint64_t>(lo) | (static_cast<uint64_t>(hi) << 32);
+}
+
+__device__ __forceinline__ void e8_root_decode_8d_fast(uint8_t root_code, uint8_t rad_axis_code, int8_t out[8]) {
+    e8_root_decode_8d_lut(root_code, rad_axis_code, out);
 }
 
 __device__ __forceinline__ void e8_root_decode_8d_int8(uint8_t root_code, uint8_t rad_axis_code, int8_t out[8]) {

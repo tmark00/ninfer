@@ -14,10 +14,28 @@ namespace {
 // Past this many blocks the gated epilogue gives up its hoisted loads. Below one block per SM the
 // prefetch is the only source of overlap and those kernels run at 0.83x to 0.96x; above it a
 // second resident block already supplies that overlap and only the register cost is left (35 -> 50
-// on the warp kernel), which measures 1.02x to 1.14x. Swept over grid size on both gated shapes
-// the crossing sits between 176 and 192 blocks; this is the 170 SMs of this part, a literal
-// because nothing in the tree queries the device, so it is not portable.
-constexpr std::int64_t kRmsPrefetchBlocks = 170;
+// on the warp kernel), which measures 1.02x to 1.14x.
+//
+// Upstream swept this on a 170-SM part, found the crossing between 176 and 192 blocks, and wrote
+// 170 as a literal with the note that it is the SM count of that part and so not portable. It is
+// not: this fork runs a GB203 Laptop with 82 SMs, where a literal 170 would keep the prefetch
+// through the whole 82-to-170 band that upstream measured at up to 1.136x. The quantity the sweep
+// actually found is one block per SM, so ask the device for it - the same cached-static pattern
+// the BF16 GDN gating plan already uses for its residency arithmetic.
+std::int64_t rms_prefetch_blocks() {
+    static const std::int64_t count = [] {
+        int device = 0;
+        CUDA_CHECK(cudaGetDevice(&device));
+        int multiprocessors = 0;
+        CUDA_CHECK(
+            cudaDeviceGetAttribute(&multiprocessors, cudaDevAttrMultiProcessorCount, device));
+        if (multiprocessors <= 0) {
+            throw std::runtime_error("RMSNorm launcher: device reports no multiprocessors");
+        }
+        return static_cast<std::int64_t>(multiprocessors);
+    }();
+    return count;
+}
 
 template <RmsEpilogue Epilogue>
 void launch_rmsnorm(const Tensor& x, const Tensor& weight, const Tensor* z, Tensor& out,
@@ -50,7 +68,7 @@ void launch_rmsnorm(const Tensor& x, const Tensor& weight, const Tensor* z, Tens
         constexpr int kWarpsPerBlock = kBlock / kWarpSize;
         const auto blocks = static_cast<unsigned int>((rows + kWarpsPerBlock - 1) / kWarpsPerBlock);
         if constexpr (kGateOnGrid) {
-            if (blocks > kRmsPrefetchBlocks) {
+            if (blocks > rms_prefetch_blocks()) {
                 rmsnorm_warp_bf16x2_kernel<Epilogue, kBlock, false><<<blocks, kBlock, 0, stream>>>(
                     reinterpret_cast<const __nv_bfloat162*>(x_bf16),
                     reinterpret_cast<const __nv_bfloat162*>(w_bf16),
@@ -83,7 +101,7 @@ void launch_rmsnorm(const Tensor& x, const Tensor& weight, const Tensor* z, Tens
                 reinterpret_cast<__nv_bfloat162*>(out_bf16), d, rows, eps);
     } else if (aligned2 && d > 3072 && d <= 8192 && d % 1024 == 0) {
         if constexpr (kGateOnGrid) {
-            if (rows > kRmsPrefetchBlocks) {
+            if (rows > rms_prefetch_blocks()) {
                 rmsnorm_cta_bf16x2_kernel<Epilogue, 512, 8, false>
                     <<<static_cast<unsigned int>(rows), 512, 0, stream>>>(
                         reinterpret_cast<const __nv_bfloat162*>(x_bf16),

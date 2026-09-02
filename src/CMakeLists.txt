@@ -337,6 +337,7 @@ if(NINFER_BUILD_SERVE)
     serve/generation_service.cpp
     serve/request_log.cpp
     serve/http_server.cpp
+    serve/mcp_proxy.cpp
     serve/responses_http.cpp
     serve/serve_options.cpp
     serve/webui_update.cpp)

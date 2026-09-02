@@ -2,6 +2,7 @@
 
 #include "serve/anthropic_schema.h"
 #include "serve/console_log.h"
+#include "serve/mcp_proxy.h"
 #include "serve/openai_schema.h"
 #include "serve/request_log.h"
 #include "serve/translate.h"
@@ -12,6 +13,8 @@
 #include <atomic>
 #include <algorithm>
 #include <chrono>
+#include <condition_variable>
+#include <deque>
 #include <exception>
 #include <filesystem>
 #include <fstream>
@@ -20,6 +23,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -38,6 +42,80 @@ class ClientDisconnected final : public std::exception {
 public:
     [[nodiscard]] const char* what() const noexcept override { return "client disconnected"; }
 };
+
+// One upstream MCP exchange in flight for the webui's relay. cpp-httplib writes
+// this server's status and headers when the route handler returns, but the
+// upstream status is only known once the request is on the wire, so the call runs
+// on its own thread and the handler blocks until the response head arrives. The
+// body then flows through the queue into a chunked provider, which is what keeps
+// the long-lived MCP GET channel streaming instead of buffering it whole.
+struct McpProxyRelay {
+    std::mutex mutex;
+    std::condition_variable cv;
+    std::deque<std::string> chunks;
+    bool head_ready = false;
+    bool finished   = false;
+    bool abandoned  = false; // the browser hung up; stop draining upstream
+    int status      = 0;
+    httplib::Headers response_headers;
+    std::string error;
+    std::thread worker;
+
+    ~McpProxyRelay() {
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            abandoned = true;
+        }
+        if (worker.joinable()) { worker.join(); }
+    }
+};
+
+void run_mcp_proxy(std::shared_ptr<McpProxyRelay> relay, McpProxyTarget target, std::string method,
+                   httplib::Headers headers, std::string body) {
+    httplib::Client client(target.host, target.port);
+    client.set_connection_timeout(std::chrono::seconds(5));
+    // The MCP GET channel stays open for the life of the session and is silent
+    // between events, so a short read timeout would tear it down mid-session.
+    client.set_read_timeout(std::chrono::hours(1));
+    client.set_write_timeout(std::chrono::seconds(30));
+    client.set_keep_alive(false);
+
+    httplib::Request upstream;
+    upstream.method           = std::move(method);
+    upstream.path             = target.path;
+    upstream.headers          = std::move(headers);
+    upstream.body             = std::move(body);
+    upstream.response_handler = [relay](const httplib::Response& response) {
+        {
+            std::lock_guard<std::mutex> lock(relay->mutex);
+            relay->status           = response.status;
+            relay->response_headers = response.headers;
+            relay->head_ready       = true;
+        }
+        relay->cv.notify_all();
+        return true;
+    };
+    upstream.content_receiver = [relay](const char* data, std::size_t length, std::uint64_t,
+                                        std::uint64_t) {
+        {
+            std::lock_guard<std::mutex> lock(relay->mutex);
+            if (relay->abandoned) { return false; }
+            relay->chunks.emplace_back(data, length);
+        }
+        relay->cv.notify_all();
+        return true;
+    };
+
+    const httplib::Result result = client.send(upstream);
+    {
+        std::lock_guard<std::mutex> lock(relay->mutex);
+        // A transport failure after the head arrived is a truncated stream, not a
+        // failed request: the status is already on its way to the browser.
+        if (!result && !relay->head_ready) { relay->error = httplib::to_string(result.error()); }
+        relay->finished = true;
+    }
+    relay->cv.notify_all();
+}
 
 void write_stream_item(httplib::DataSink& sink, StreamingRequest& request,
                        const std::string& item) {
@@ -186,7 +264,7 @@ bool HttpServer::webui_spa_path(const std::string& path) const {
     // degrades exactly as it did against a real llama-server, rather than getting the
     // SPA shell back for an API call.
     if (path == "/props" || path == "/health" || path == "/slots" || path == "/tools" ||
-        path == "/v1/streams/lookup") {
+        path == "/v1/streams/lookup" || path == kMcpProxyPath) {
         return false;
     }
     if (path.rfind("/_app/", 0) == 0) { return false; }
@@ -469,6 +547,21 @@ void HttpServer::register_routes() {
     server_.Post("/v1/messages", [this](const httplib::Request& req, httplib::Response& res) {
         handle_messages(req, res);
     });
+
+    if (options_.webui_mcp_proxy) {
+        // Same-origin relay for the webui's MCP client. Deliberately outside
+        // is_api_path(): the webui prefixes every header it means for the MCP
+        // server, including its own Authorization, so nothing arrives here that
+        // could carry this server's API key. Requiring the key would break the
+        // feature outright rather than protect it, which is why the relay is
+        // opt-in and the bind address is the boundary that matters.
+        auto relay = [this](const httplib::Request& req, httplib::Response& res) {
+            handle_mcp_proxy(req, res);
+        };
+        server_.Get(kMcpProxyPath, relay);
+        server_.Post(kMcpProxyPath, relay);
+        server_.Delete(kMcpProxyPath, relay);
+    }
 }
 
 // The /v1 discovery document. An API base is not itself an OpenAI resource, so
@@ -583,6 +676,9 @@ nlohmann::json make_props_stub(const ServeOptions& options, const std::string& m
     props["total_slots"] = 1;
     props["model_path"] = options.artifact_path;
     props["role"] = "model";
+    // The webui ungreys its "Use llama-server proxy" option from this flag alone;
+    // without it the relay route is unreachable from the UI even when it is running.
+    props["cors_proxy_enabled"] = options.webui_mcp_proxy;
     props["modalities"] = {{"vision", options.enable_vision}, {"audio", false}, {"video", false}};
     // Capability marker only: clients that probe the chat template (e.g. the
     // webui's thinking-support heuristic) need `enable_thinking` to appear; the
@@ -623,6 +719,72 @@ void HttpServer::handle_model(const httplib::Request& req, httplib::Response& re
 
 void HttpServer::handle_props(const httplib::Request&, httplib::Response& res) const {
     res.set_content(make_props_stub(options_, public_model_id_).dump(), "application/json");
+}
+
+void HttpServer::handle_mcp_proxy(const httplib::Request& req, httplib::Response& res) {
+    const McpProxyRequest parsed = parse_mcp_proxy_request(req);
+    if (!parsed.ok) {
+        ApiError error;
+        error.status  = 400;
+        error.type    = "invalid_request_error";
+        error.code    = "invalid_proxy_target";
+        error.message = "mcp proxy: " + parsed.error;
+        write_error(res, error);
+        return;
+    }
+
+    auto relay = std::make_shared<McpProxyRelay>();
+    relay->worker =
+        std::thread(run_mcp_proxy, relay, parsed.target, req.method, parsed.headers, req.body);
+
+    std::unique_lock<std::mutex> lock(relay->mutex);
+    relay->cv.wait(lock, [&relay] { return relay->head_ready || relay->finished; });
+    if (!relay->head_ready) {
+        const std::string reason = relay->error.empty() ? "upstream request failed" : relay->error;
+        lock.unlock();
+        ApiError error;
+        error.status  = 502;
+        error.type    = "upstream_error";
+        error.code    = "proxy_target_unreachable";
+        error.message = "mcp proxy: " + reason;
+        write_error(res, error);
+        return;
+    }
+    res.status                              = relay->status;
+    const httplib::Headers upstream_headers = relay->response_headers;
+    lock.unlock();
+
+    std::string content_type = "application/octet-stream";
+    for (const auto& [name, value] : upstream_headers) {
+        if (is_hop_by_hop_response_header(name)) { continue; }
+        // The chunked provider owns Content-Type; setting it here too would emit
+        // the header twice.
+        if (header_name_is(name, "content-type")) {
+            content_type = value;
+            continue;
+        }
+        res.set_header(name, value);
+    }
+
+    res.set_chunked_content_provider(
+        content_type, [relay](std::size_t, httplib::DataSink& sink) -> bool {
+            std::unique_lock<std::mutex> lock(relay->mutex);
+            relay->cv.wait(lock, [&relay] { return !relay->chunks.empty() || relay->finished; });
+            std::deque<std::string> ready;
+            ready.swap(relay->chunks);
+            const bool drained = relay->finished && ready.empty();
+            lock.unlock();
+
+            for (const std::string& chunk : ready) {
+                if (!sink.write(chunk.data(), chunk.size())) {
+                    std::lock_guard<std::mutex> abandon(relay->mutex);
+                    relay->abandoned = true;
+                    return false;
+                }
+            }
+            if (drained) { sink.done(); }
+            return true;
+        });
 }
 
 void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::Response& res) {

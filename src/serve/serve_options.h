@@ -56,6 +56,9 @@ struct ServeOptions {
                                     // webui from the ggml-org/llama-ui HF bucket
     std::string webui_dir;          // --webui-dir: serve this dir; also the download
                                     // location for --webui (default: <artifact-dir>/webui)
+    bool webui_mcp_proxy = false;   // --webui-mcp-proxy: relay the webui's MCP traffic
+                                    // through this server so the browser never has to
+                                    // clear CORS against the MCP server itself
     // Process-level explicit overrides layered between registered model/mode defaults and request
     // fields. An omitted seed is replaced per request with a fresh random seed.
     SamplingOverrides sampling_overrides;

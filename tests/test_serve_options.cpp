@@ -58,6 +58,14 @@ int main() {
         "server defaults unexpectedly override registered model sampling");
     failures += check(resolve_public_model_id(defaults, "artifact-model") == "artifact-model",
                       "artifact model id was not selected by default");
+    // The relay reaches arbitrary hosts and carries no API key, so it must stay
+    // off until it is asked for by name.
+    failures += check(!defaults.webui_mcp_proxy, "the webui MCP relay is not disabled by default");
+
+    const ServeOptions mcp_proxy =
+        parse({"ninfer-serve", "model.ninfer", "--webui", "--webui-mcp-proxy"});
+    failures += check(mcp_proxy.webui_mcp_proxy && mcp_proxy.webui_auto,
+                      "--webui-mcp-proxy did not enable the relay alongside --webui");
 
     const ServeOptions model_alias =
         parse({"ninfer-serve", "model.ninfer", "--model-id", "deployment-alias"});

@@ -79,7 +79,7 @@ std::string serve_usage_text(const char* argv0) {
            "[--default-max-tokens N] "
            "[--vision] [--vision-residency resident|overlay] [--vision-max-merged N] [--no-cuda-graph] [--no-prefix-reuse] "
            "[--lm-head-draft] [--adaptive-mtp] [--no-thinking] [--preserve-thinking] [--cors] "
-           "[--webui | --webui-dir DIR] "
+           "[--webui | --webui-dir DIR] [--webui-mcp-proxy] "
            "[--temperature F] [--top-p F] [--top-k N] [--min-p F] [--presence-penalty F] "
            "[--frequency-penalty F] [--seed N] [--greedy]\n"
            "       serves OpenAI Responses/Chat Completions and Anthropic Messages endpoints\n"
@@ -111,6 +111,12 @@ std::string serve_usage_text(const char* argv0) {
            "HF bucket) into the webui dir and serves it at / alongside the API\n"
            "       --webui-dir DIR serves (and for --webui, downloads into) DIR; "
            "defaults to <model dir>/webui\n"
+           "       --webui-mcp-proxy relays the webui's MCP traffic through this server at "
+           "/cors-proxy, which the webui's \"Use llama-server proxy\" option expects; MCP "
+           "servers answer POST from a raw writer and send no CORS headers, so a browser "
+           "cannot reach them directly. http targets only (this build has no TLS client). "
+           "The relay forwards to any host it is given and carries no API key, so enable it "
+           "only on a trusted bind address.\n"
            "       --greedy forces temperature 0 (exact argmax).\n";
 }
 
@@ -269,6 +275,8 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.enable_cors = true;
         } else if (arg == "--webui") {
             options.webui_auto = true;
+        } else if (arg == "--webui-mcp-proxy") {
+            options.webui_mcp_proxy = true;
         } else if (arg == "--webui-dir") {
             options.webui_dir = require_value("--webui-dir");
             if (options.webui_dir.empty()) {

@@ -129,7 +129,7 @@ void write_stream_item(httplib::DataSink& sink, StreamingRequest& request,
 void set_owned_content(httplib::Response& response, std::string body,
                        std::shared_ptr<RequestLifetime> lifetime) {
     response.set_content(std::move(body), "application/json");
-    response.hold_resource(std::move(lifetime));
+    response.user_data.set("ninfer.request_lifetime", std::move(lifetime));
 }
 
 void write_error(httplib::Response& res, const ApiError& error) {
@@ -216,7 +216,7 @@ HttpServer::HttpServer(ServeOptions options)
         static_cast<std::size_t>(options_.max_concurrency) + options_.max_pending_requests;
     const std::size_t worker_count = queued_requests + 1;
     server_.new_task_queue         = [queued_requests, worker_count] {
-        return new httplib::ThreadPool(worker_count, queued_requests);
+        return new httplib::ThreadPool(worker_count, worker_count, queued_requests);
     };
     server_.set_payload_max_length(options_.max_request_bytes);
     if (!options_.webui_dir.empty()) {
@@ -821,7 +821,7 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
     PreparedRequest prepared;
     try {
         prepared = service_->prepare(
-            request, [&req] { return req.is_connection_alive && !req.is_connection_alive(); });
+            request, [&req] { return req.is_connection_closed(); });
     } catch (const ApiException& e) {
         log_request_rejected(make_request_rejection_log_context(req_id, "openai_chat_completions",
                                                                 request, e.error()));
@@ -849,7 +849,7 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
     if (!request.stream) {
         try {
             const GenerationOutcome outcome = service_->run(prepared, nullptr, [&req] {
-                return req.is_connection_alive && !req.is_connection_alive();
+                return req.is_connection_closed();
             });
             log_request_done(log_context, outcome);
             const CompletionUsage usage{outcome.prompt_tokens, outcome.completion_tokens};
@@ -986,7 +986,7 @@ void HttpServer::handle_count_tokens(const httplib::Request& req, httplib::Respo
         limits.default_max_tokens       = options_.default_max_tokens;
         const GenerationRequest request = parse_messages_request(body, limits);
         const int input_tokens          = service_->count_prompt_tokens(
-            request, [&req] { return req.is_connection_alive && !req.is_connection_alive(); });
+            request, [&req] { return req.is_connection_closed(); });
         res.set_content(make_count_tokens_response(input_tokens), "application/json");
     } catch (const ApiException& e) {
         write_messages_error(res, e.error());
@@ -1034,7 +1034,7 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
     PreparedRequest prepared;
     try {
         prepared = service_->prepare(
-            request, [&req] { return req.is_connection_alive && !req.is_connection_alive(); });
+            request, [&req] { return req.is_connection_closed(); });
     } catch (const ApiException& e) {
         log_request_rejected(
             make_request_rejection_log_context(req_id, "anthropic_messages", request, e.error()));
@@ -1062,7 +1062,7 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
     if (!request.stream) {
         try {
             const GenerationOutcome outcome = service_->run(prepared, nullptr, [&req] {
-                return req.is_connection_alive && !req.is_connection_alive();
+                return req.is_connection_closed();
             });
             log_request_done(log_context, outcome);
             const CompletionUsage usage{outcome.prompt_tokens, outcome.completion_tokens};

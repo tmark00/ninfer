@@ -5,18 +5,16 @@
 #include <spdlog/sinks/sink.h>
 #include <spdlog/sinks/stdout_color_sinks.h>
 
-#include <unistd.h>
-
-#include <atomic>
-#include <chrono>
-#include <cstdio>
-#include <ctime>
-#include <cstdio>
 #ifdef _WIN32
 #include <io.h>
 #else
 #include <unistd.h>
 #endif
+
+#include <atomic>
+#include <chrono>
+#include <cstdio>
+#include <ctime>
 #include <iterator>
 #include <memory>
 #include <mutex>

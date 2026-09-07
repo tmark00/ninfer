@@ -27,9 +27,19 @@ constexpr Geometry kQwen27{"qwen3_6_27b", 5120, 48, false};
 constexpr Geometry kQwen38Parent{"qwen3_8_27b_parent", 5120, 48, true};
 constexpr Geometry kQwen35{"qwen3_6_35b_a3b", 2048, 32, true};
 
-constexpr ReductionCriterion kGdnProjectionFp32{/*relative_l2=*/1.4e-6,
+// Sized for the unsplit MMA route, which is the least accurate registered projection route.
+// A split-K route chains only K/SplitK tiles into each fp32 MMA accumulator and reduces the
+// partials across the grid; the unsplit route chains all 320 K tiles into one accumulator, so
+// its rounding error carries the full K=5120 dependency chain and measures 5-8x the split
+// routes'. That route is not an edge case: it covers T>=4097 everywhere, and the planner also
+// falls back to it whenever a split cooperative grid exceeds device residency -- on an 82-SM
+// Laptop RTX 5090 that is T=1024, where split8's 192 CTAs do not fit the 164-CTA budget.
+// Measured gross ratios for 27B g against a 5.0e-6 bound: 0.01-0.11 on the split routes, 0.44
+// at T=4097 and 0.58 at T=1024 on the unsplit route. A 2.5e-6 bound fits only the split
+// routes; it was measured on a 170-SM desktop, where T=1024 still resolves to split8.
+constexpr ReductionCriterion kGdnProjectionFp32{/*relative_l2=*/2.0e-6,
                                                 /*gross_absolute=*/5.0e-7,
-                                                /*gross_relative_to_max_reference=*/2.5e-6};
+                                                /*gross_relative_to_max_reference=*/5.0e-6};
 constexpr ReductionCriterion kGdnNormOutputBf16{/*relative_l2=*/1.75e-3,
                                                 /*gross_absolute=*/1.0e-4,
                                                 /*gross_relative_to_max_reference=*/4.0e-3};

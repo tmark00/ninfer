@@ -36,13 +36,15 @@ comes out.
 
 ## How changes get in
 
-Six rules, each of them learned the expensive way.
+Eight rules, each of them learned the expensive way.
 
 **1. Measure on this machine, or do not carry it.** Every patch is A/B'd on the same binary, the
 same prompt, with speculative-decode acceptance as a control. Upstream's MoE-prefetch PR claimed
 +3.7%; measured here it was inside run-to-run variance, so it was dropped. A turboquant LUT hoist
 claimed nothing in particular and was worth +2% at depth, so it stayed. Benchmarks published
-against a 35B-A3B do not transfer to a 27B dense model.
+against a 35B-A3B do not transfer to a 27B dense model. How many runs a claim needs is
+proportional to what it decides: five interleaved A/B/A/B passes when the answer picks a
+direction, one or two when it is curiosity.
 
 **2. Carry no unmeasured divergence.** Fork divergence is a standing cost paid at every rebase.
 A commit that cannot be shown to help on this configuration is not kept "just in case".
@@ -67,7 +69,29 @@ invariant to context depth, over raw tokens per second.
 **6. Prefill is what you wait for.** In agentic sessions the user waits on time-to-first-token,
 not on decode. The two largest wins here are both prefill wins: raising the prefill chunk to 1024
 (2001 → 2817 tok/s) and keeping reasoning between turns so the prefix cache stops rewinding
-(−67% TTFT per request, −53% of all prefill work).
+(−67% TTFT per request, −53% of all prefill work). Two kernel patches taken from upstream in
+September 2026 — reading the NVFP4 activation scales tile-contiguous, and walking that kernel's
+grid token-fastest so the weight matrix is streamed once instead of once per tile — added a
+further 13.7%, from 4827 to 5488 tok/s.
+
+**7. Measure through a warm server, not repeated launches of the CLI.** A fresh process spends
+about twelve seconds loading at idle clocks and then measures a 1.4-second window while the clock
+is still climbing. The result is not noisy, it is *bimodal*: one run in three lands 6–14% low, and
+averaging them hides it. The same work driven at an already-warm server has a coefficient of
+variation near 0.5% and no outliers at all, which is the difference between being able to resolve
+a 1% effect and not. Record the laptop's power mode with every number — Balanced, Performance and
+Hyperboost are three different machines, and a comparison that spans two of them is measuring the
+fans.
+
+**8. Verify a port twice: once by the diff, once by the output.** *By the diff*, because on Windows
+a clean-looking patch can be an entire file rewritten in CRLF — and `git show HEAD:file` hides the
+carriage returns, so the only honest witnesses are `git cat-file blob` and what `git diff --cached
+--stat` says after staging. Twenty-four changed lines and four hundred and thirty-one look
+identical in the terminal. *By the output*, because a kernel patch that is meant to be a pure
+scheduling change should emit token-for-token what it replaced; that check is cheap and it is the
+only inexpensive way to tell a correct port from a subtly wrong one. An approximation has to outbid
+it. Upstream's approximate `silu` was worth a real +0.87% here (t = 4.96) and was still reverted,
+because a percent does not buy back the ability to verify.
 
 ## Layout
 

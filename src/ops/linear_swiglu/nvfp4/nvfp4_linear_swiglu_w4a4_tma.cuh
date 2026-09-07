@@ -63,8 +63,11 @@ __global__ __launch_bounds__(
 
     extern __shared__ __align__(128) unsigned char shared_bytes[];
     auto& shared = *reinterpret_cast<Nvfp4LinearSwiGluTmaSharedStorage<Schedule>*>(shared_bytes);
-    const int token_begin = static_cast<int>(blockIdx.y) * Schedule::kBlockM;
-    const int pair_begin  = static_cast<int>(blockIdx.x) * kPairN;
+    int block_x = 0;
+    int block_y = 0;
+    nvfp4_tma_raster_blocks(block_x, block_y);
+    const int token_begin = block_y * Schedule::kBlockM;
+    const int pair_begin  = block_x * kPairN;
 
     if (threadIdx.x == 0) {
 #pragma unroll

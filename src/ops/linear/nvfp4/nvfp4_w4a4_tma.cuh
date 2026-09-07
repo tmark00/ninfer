@@ -171,6 +171,25 @@ __device__ __forceinline__ void nvfp4_mbarrier_arrive_expect_tx(std::uint64_t* b
                  : "memory");
 }
 
+// Dystrybutor pracy wydaje CTA po kolei, blockIdx.x najszybciej. Przy siatce
+// x = kafelki wierszy wag, y = kafelki tokenow oznacza to, ze CTA biegnace w tym
+// samym czasie trzymaja ROZNE kafelki wag - i cala macierz wag jest wczytywana
+// z pamieci raz na kazdy kafelek tokenow. Chodzenie najszybciej po tokenach
+// ustawia obok siebie te CTA, ktore dziela kafelek wag, i macierz idzie raz.
+// bf16_gemm_mma_kernel juz tak robi; Bf16MmaRaster::TokenFast jest domyslne dla
+// kazdego harmonogramu bf16 w drzewie.
+//
+// Wziete z gornej polowy upstreamowego PR #204. DOLNEJ polowy (pobieranie skal
+// aktywacji raz na dwa kafelki K) NIE bierzemy - rusza te sama linie co PR #160,
+// ktory juz mamy w 5fc2f2f0, i rozwiazuje ten sam problem inaczej.
+__device__ __forceinline__ void nvfp4_tma_raster_blocks(int& block_x, int& block_y) {
+    const int rows = static_cast<int>(gridDim.y);
+    const int linear =
+        static_cast<int>(blockIdx.y) * static_cast<int>(gridDim.x) + static_cast<int>(blockIdx.x);
+    block_y = linear % rows;
+    block_x = linear / rows;
+}
+
 __device__ __forceinline__ void nvfp4_tma_load_2d(void* destination, const CUtensorMap* descriptor,
                                                   std::int32_t coordinate0,
                                                   std::int32_t coordinate1,
@@ -193,8 +212,11 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_w4a4
 
     extern __shared__ __align__(128) unsigned char shared_bytes[];
     auto& shared          = *reinterpret_cast<Nvfp4W4a4TmaSharedStorage<Schedule>*>(shared_bytes);
-    const int token_begin = static_cast<int>(blockIdx.y) * Schedule::kBlockM;
-    const int row_begin   = static_cast<int>(blockIdx.x) * Schedule::kBlockN;
+    int block_x = 0;
+    int block_y = 0;
+    nvfp4_tma_raster_blocks(block_x, block_y);
+    const int token_begin = block_y * Schedule::kBlockM;
+    const int row_begin   = block_x * Schedule::kBlockN;
 
     if (threadIdx.x == 0) {
 #pragma unroll

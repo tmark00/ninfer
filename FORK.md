@@ -36,7 +36,7 @@ comes out.
 
 ## How changes get in
 
-Eight rules, each of them learned the expensive way.
+Ten rules, each of them learned the expensive way.
 
 **1. Measure on this machine, or do not carry it.** Every patch is A/B'd on the same binary, the
 same prompt, with speculative-decode acceptance as a control. Upstream's MoE-prefetch PR claimed
@@ -81,7 +81,10 @@ averaging them hides it. The same work driven at an already-warm server has a co
 variation near 0.5% and no outliers at all, which is the difference between being able to resolve
 a 1% effect and not. Record the laptop's power mode with every number — Balanced, Performance and
 Hyperboost are three different machines, and a comparison that spans two of them is measuring the
-fans.
+fans. Interleaving alone does not save you either: a plain A/B/A/B against a clock that sinks
+monotonically through the session puts every B later than its A, and the drift lands on the arm
+difference. One such run read +0.00% on pooled medians while B lost all three pairs. Counterbalance
+the order — ABBA — so each pair holds one A before and one after.
 
 **8. Verify a port twice: once by the diff, once by the output.** *By the diff*, because on Windows
 a clean-looking patch can be an entire file rewritten in CRLF — and `git show HEAD:file` hides the
@@ -93,11 +96,35 @@ only inexpensive way to tell a correct port from a subtly wrong one. An approxim
 it. Upstream's approximate `silu` was worth a real +0.87% here (t = 4.96) and was still reverted,
 because a percent does not buy back the ability to verify.
 
+**9. A wrong constant is not a finding; what it does at your operating point is.** Upstream writes
+its SM count as a literal 170, the desktop part, and that literal is wrong twice over in this tree
+on an 82-SM laptop. Fixing it in the sparse-MoE prefill was worth +1.92 pp with t = 19.3 and was
+taken; fixing it in the GDN chunked output measured −0.35 pp with t = −1.5 and was thrown away. The
+difference is not the constant, it is where our fixed prefill chunk lands against it. The MoE
+kernels are persistent, and 510 uniform blocks over 246 slots retire in three waves with the last
+one carrying eighteen blocks; the GDN launcher at our one operating point merely reshuffled a
+single wave. Compute where you actually sit before you believe a diff.
+
+**10. Calibrate a probe in the units the system measures, and distrust one nothing fails.** A
+long-context probe sized in bytes came out at 182k and 266k tokens against a 240k and 350k target,
+because the corpus ran 3.52 bytes to the token and not the assumed 2.6 — which left the deep arm
+3673 tokens past the ceiling with its deepest needle still inside it. Three clean 6/6 results, and
+the one that was supposed to prove something proved nothing. Read back the count the server itself
+reports. And when every arm scores full marks, say so plainly: a saturated test shows an effect is
+absent, never how large it is, and ranking arms needs a task the baseline does not already ace.
+
 ## Layout
 
 `e8-overlay-adaptive` is the daily driver. `e8-win` and `e8-win-overlay` are deliberately older
 known-good fallbacks — they are *not* kept in sync, so that a bad day on the driver has somewhere
 to fall back to. The `pr*` branches hold A/B endpoints, including patches that were measured and
 rejected. Tags named `pre-*` are rollback points taken before each round of changes.
+
+`yarn-393k` is the one branch that serves past the model's native context. The 27B weights are
+trained to 262,144; it adds YaRN and raises the ceiling to 393,216 at scale 1.5, which the probe in
+`tools/long_context_probe` reads and reasons over at 381k tokens for about 1% of prefill. It stays
+a branch rather than a merge because the rotation changes, so the same prompt takes a different
+greedy path even well inside the native range — a separate serving mode, not a larger ceiling on
+the daily driver.
 
 Licensed under Apache 2.0, like upstream.

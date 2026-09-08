@@ -40,4 +40,31 @@ void rope(const Tensor& positions, int rotary_dim, float theta, Tensor& q, Tenso
 // from x; Q versus K role does not change the transformation.
 void rope(const Tensor& positions, int rotary_dim, float theta, Tensor& x, cudaStream_t stream);
 
+/**
+ * YaRN interpolation parameters for the text and DFlash rotary tables.
+ *
+ * A factor of 1 restores the unscaled tables, which is the state the process starts in. Any other
+ * factor rewrites the inverse-frequency tables in place: pairs whose wavelength completes more than
+ * beta_fast rotations across original_context keep extrapolating, pairs below beta_slow rotations
+ * are interpolated by factor, and the band between those two correction dimensions ramps linearly.
+ * The attention scale 0.1*ln(factor)+1 is folded into the emitted sine and cosine, so it reaches Q
+ * and K alike and the logits carry its square, which is what the reference implementation does.
+ *
+ * Vision rotary frequencies are never touched: image positions are not sequence positions.
+ *
+ * The tables are process-wide device state read by every later rope launch, so this must run before
+ * the first one and be left alone afterwards. KV written under one factor is meaningless under
+ * another, so a served process may not change it while sequences are resident.
+ */
+struct RopeScaling {
+    float factor           = 1.0F;
+    float original_context = 0.0F;
+    float text_theta       = 0.0F;
+    float dflash_theta     = 0.0F;
+    float beta_fast        = 32.0F;
+    float beta_slow        = 1.0F;
+};
+
+void rope_configure_scaling(const RopeScaling& scaling);
+
 } // namespace ninfer::ops

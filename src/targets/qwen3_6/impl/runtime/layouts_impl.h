@@ -10,6 +10,7 @@
 #include "ninfer/ops/gdn_input_proj.h"
 #include "ninfer/ops/linear_add.h"
 #include "ninfer/ops/linear_swiglu.h"
+#include "ninfer/ops/rope.h"
 #include "ninfer/ops/sampling.h"
 #include "ninfer/ops/speculative_round.h"
 #include "ninfer/ops/gqa_attention.h"
@@ -17,6 +18,7 @@
 #include "ninfer/ops/swa.h"
 
 #include <algorithm>
+#include <cmath>
 #include <initializer_list>
 #include <limits>
 #include <stdexcept>
@@ -567,8 +569,24 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
 }
 
 void validate_target_options(DeviceContext& device, const EngineOptions& options) {
-    if (options.max_context == 0 || options.max_context > Variant::maximum_context) {
+    if (!(options.rope_scale >= 1.0F) || !(options.rope_scale <= 8.0F)) {
+        throw std::invalid_argument("rope_scale must lie in [1,8]");
+    }
+    // The ceiling the weights were trained for, times whatever YaRN is asked to stretch it by.
+    const auto scaled_ceiling = static_cast<std::uint64_t>(
+        std::floor(static_cast<double>(Variant::maximum_context) * options.rope_scale));
+    if (options.max_context == 0 || options.max_context > scaled_ceiling) {
         throw std::invalid_argument("max_context exceeds the variant native context capacity");
+    }
+    if (options.rope_scale > 1.0F) {
+        ops::RopeScaling scaling;
+        scaling.factor           = options.rope_scale;
+        scaling.original_context = static_cast<float>(Variant::maximum_context);
+        // Both shipped tables are generated from the text rotary base: the DFlash entries match
+        // base^(-2i/128) for the same base, checked against the constants in rope.cuh.
+        scaling.text_theta   = Variant::TextConfig::rope_theta;
+        scaling.dflash_theta = Variant::TextConfig::rope_theta;
+        ops::rope_configure_scaling(scaling);
     }
     if (options.prefill_chunk == 0 || options.prefill_chunk % kPrefillChunkAlignment != 0) {
         throw std::invalid_argument("prefill_chunk must be a nonzero multiple of 128");

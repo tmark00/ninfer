@@ -2,9 +2,14 @@
 #include "ops/launcher/rope.h"
 
 #include "core/device.h" // CUDA_CHECK
+#include "ninfer/ops/rope.h"
 #include "ops/kernel/rope.cuh"
 
+#include <algorithm>
+#include <cmath>
 #include <cstdint>
+#include <stdexcept>
+#include <vector>
 
 namespace ninfer::ops::detail {
 namespace {
@@ -198,3 +203,79 @@ void rope_single_launch(const Tensor& positions, int rotary_dim, float theta, Te
 }
 
 } // namespace ninfer::ops::detail
+
+namespace ninfer::ops {
+namespace {
+
+constexpr double kTwoPiHost = 6.283185307179586476925286766559;
+
+// The dimension at which a pair completes `rotations` turns across the original context. This is
+// stated in full rotary-dimension units while the ramp below indexes pairs, which is how the
+// reference implementation writes it; for both tables here the result lands inside the pair range.
+double yarn_correction_dim(double rotations, int rotary_dim, double theta, double original_context) {
+    return (rotary_dim * std::log(original_context / (rotations * kTwoPiHost))) /
+           (2.0 * std::log(theta));
+}
+
+template <class Element>
+std::vector<Element> yarn_table(int pairs, double theta, const RopeScaling& scaling) {
+    const int rotary_dim = pairs * 2;
+    const double context = static_cast<double>(scaling.original_context);
+    const double low     = std::max(
+        std::floor(yarn_correction_dim(scaling.beta_fast, rotary_dim, theta, context)), 0.0);
+    const double high = std::min(
+        std::ceil(yarn_correction_dim(scaling.beta_slow, rotary_dim, theta, context)),
+        static_cast<double>(rotary_dim - 1));
+
+    std::vector<Element> table(static_cast<std::size_t>(pairs));
+    for (int pair = 0; pair < pairs; ++pair) {
+        const double position_frequency = std::pow(theta, (2.0 * pair) / rotary_dim);
+        const double extrapolation      = 1.0 / position_frequency;
+        const double interpolation      = extrapolation / static_cast<double>(scaling.factor);
+        const double span               = high - low;
+        const double ramp =
+            span > 0.0 ? std::clamp((static_cast<double>(pair) - low) / span, 0.0, 1.0) : 1.0;
+        table[static_cast<std::size_t>(pair)] =
+            static_cast<Element>(extrapolation * (1.0 - ramp) + interpolation * ramp);
+    }
+    return table;
+}
+
+} // namespace
+
+void rope_configure_scaling(const RopeScaling& scaling) {
+    if (!(scaling.factor >= 1.0F)) {
+        throw std::invalid_argument("rope scaling factor must be at least 1");
+    }
+    if (scaling.factor == 1.0F) { return; }
+    if (!(scaling.original_context > 0.0F) || !(scaling.text_theta > 1.0F) ||
+        !(scaling.dflash_theta > 1.0F)) {
+        throw std::invalid_argument(
+            "rope scaling needs a positive original context and both rotary bases");
+    }
+    if (!(scaling.beta_fast > scaling.beta_slow) || !(scaling.beta_slow > 0.0F)) {
+        throw std::invalid_argument("rope scaling needs beta_fast > beta_slow > 0");
+    }
+
+    const std::vector<float> text = yarn_table<float>(32, scaling.text_theta, scaling);
+    const std::vector<double> dflash = yarn_table<double>(64, scaling.dflash_theta, scaling);
+    CUDA_CHECK(cudaMemcpyToSymbol(kTextRopeInvFrequency, text.data(), sizeof(float) * text.size()));
+    CUDA_CHECK(
+        cudaMemcpyToSymbol(kDflashRopeInvFrequency, dflash.data(), sizeof(double) * dflash.size()));
+
+    // The generic fallback rebuilds its frequencies from theta, so it gets the ramp rather than a
+    // table. Its correction range is the text geometry's; an unregistered shape reaching this path
+    // is a fallback, not a production geometry.
+    const double context   = static_cast<double>(scaling.original_context);
+    const auto text_low    = static_cast<float>(std::max(
+        std::floor(yarn_correction_dim(scaling.beta_fast, 64, scaling.text_theta, context)), 0.0));
+    const auto text_high   = static_cast<float>(std::min(
+        std::ceil(yarn_correction_dim(scaling.beta_slow, 64, scaling.text_theta, context)), 63.0));
+    const float attention  = 0.1F * std::log(scaling.factor) + 1.0F;
+    CUDA_CHECK(cudaMemcpyToSymbol(kRopeYarnFactor, &scaling.factor, sizeof(float)));
+    CUDA_CHECK(cudaMemcpyToSymbol(kRopeYarnLow, &text_low, sizeof(float)));
+    CUDA_CHECK(cudaMemcpyToSymbol(kRopeYarnHigh, &text_high, sizeof(float)));
+    CUDA_CHECK(cudaMemcpyToSymbol(kRopeAttentionScale, &attention, sizeof(float)));
+}
+
+} // namespace ninfer::ops

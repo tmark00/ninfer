@@ -21,6 +21,28 @@ enum class RopeKernelMode : std::int32_t {
 
 inline constexpr int kRopeMaxHalf = 128;
 
+// YaRN folds its attention scale into the rotation itself. One means an untouched rotation, which
+// is what the tables below are written for; rope_configure_scaling() overwrites both together.
+static __device__ __constant__ float kRopeAttentionScale = 1.0F;
+
+// The tables above carry YaRN already once it is configured, so the fixed geometries need nothing
+// more. The generic fallback derives its frequency from theta at run time, so it needs the ramp
+// itself; a factor of one short-circuits it. Only 1-D text positions are adjusted here: 2-D vision
+// and 3-D mrope both reach their production geometries through the tables, and scaling an image
+// axis would be wrong.
+static __device__ __constant__ float kRopeYarnFactor = 1.0F;
+static __device__ __constant__ float kRopeYarnLow    = 0.0F;
+static __device__ __constant__ float kRopeYarnHigh   = 0.0F;
+
+__device__ __forceinline__ float yarn_adjust(float inv_frequency, int pair) {
+    if (kRopeYarnFactor == 1.0F) { return inv_frequency; }
+    const float span = kRopeYarnHigh - kRopeYarnLow;
+    float ramp       = span > 0.0F ? (static_cast<float>(pair) - kRopeYarnLow) / span : 1.0F;
+    ramp             = fminf(fmaxf(ramp, 0.0F), 1.0F);
+    // ramp 0 leaves the pair extrapolating; ramp 1 interpolates it by the full factor.
+    return inv_frequency * ((1.0F - ramp) + ramp / kRopeYarnFactor);
+}
+
 static __device__ __constant__ float kTextRopeInvFrequency[32] = {
     1.000000000e+00F, 6.042963902e-01F, 3.651741273e-01F, 2.206734069e-01F, 1.333521432e-01F,
     8.058421878e-02F, 4.869675252e-02F, 2.942727176e-02F, 1.778279410e-02F, 1.074607828e-02F,
@@ -87,6 +109,8 @@ __device__ __forceinline__ void fixed_sincos(const std::int32_t* positions, int 
         const double turns  = angle * kInvTwoPi;
         const float reduced = static_cast<float>(angle - nearbyint(turns) * kTwoPi);
         sincosf(reduced, sine, cosine);
+        *sine *= kRopeAttentionScale;
+        *cosine *= kRopeAttentionScale;
     } else {
         int axis = 0;
         float frequency;
@@ -95,6 +119,11 @@ __device__ __forceinline__ void fixed_sincos(const std::int32_t* positions, int 
             static_cast<float>(positions[static_cast<std::int64_t>(axis) * tokens + token]) *
             frequency;
         sincosf(angle, sine, cosine);
+        // Image positions are not sequence positions, so vision never carries the YaRN scale.
+        if constexpr (Mode != RopeKernelMode::Vision2D) {
+            *sine *= kRopeAttentionScale;
+            *cosine *= kRopeAttentionScale;
+        }
     }
 }
 
@@ -228,11 +257,16 @@ static __global__ void rope_generic_kernel(const std::int32_t* positions, std::i
             int axis       = 0;
             float exponent = 0.0F;
             generic_axis_frequency(axes, head_dim, rotary_dim, pair, &axis, &exponent);
-            const float frequency = powf(theta, exponent);
+            float frequency = powf(theta, exponent);
+            if (axes == 1) { frequency = yarn_adjust(frequency, pair); }
             const float angle =
                 static_cast<float>(positions[static_cast<std::int64_t>(axis) * tokens + token]) *
                 frequency;
             sincosf(angle, &sin_cache[pair], &cos_cache[pair]);
+            if (axes == 1) {
+                sin_cache[pair] *= kRopeAttentionScale;
+                cos_cache[pair] *= kRopeAttentionScale;
+            }
         }
     }
     __syncthreads();

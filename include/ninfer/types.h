@@ -121,6 +121,10 @@ struct EngineOptions {
     std::uint32_t max_pending_requests = 16;
     std::uint32_t pending_timeout_ms   = 30000;
     std::uint32_t prefill_chunk        = 1024;
+    // YaRN position-interpolation factor over the variant's native context. One serves the native
+    // ceiling unscaled; anything larger raises the ceiling by the same factor and rewrites the
+    // rotary tables to match. KV written under one factor is meaningless under another.
+    float rope_scale                   = 1.0F;
     KvCacheStorage kv_cache            = KvCacheStorage::BFloat16;
     SpeculativeOptions speculative;
     std::size_t media_cache_bytes = kDefaultMediaCacheBytes;

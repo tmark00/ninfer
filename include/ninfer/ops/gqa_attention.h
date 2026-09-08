@@ -10,7 +10,13 @@
 
 namespace ninfer::ops {
 
-inline constexpr std::uint32_t kGqaAttentionMaximumVisibleKeys = 262144;
+// The largest visible-key interval the decode routes admit. This bounds nothing the kernels
+// allocate: the split count saturates at Geometry::DecodeSplits (85 for the 27B shape) once the
+// window passes roughly 41k keys, so every partial buffer has had its final size since long
+// before the old 262144 ceiling, and each split simply walks more keys. The constant appears in
+// three validation sites and nowhere else. It is raised here to cover a YaRN-stretched context;
+// the 27B native ceiling is 262144 and the branch targets 393216 at factor 1.5.
+inline constexpr std::uint32_t kGqaAttentionMaximumVisibleKeys = 524288;
 
 struct GqaExecutionEnvelope {
     std::uint32_t min_visible_keys = 0;

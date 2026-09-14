@@ -98,12 +98,20 @@ because a percent does not buy back the ability to verify.
 
 **9. A wrong constant is not a finding; what it does at your operating point is.** Upstream writes
 its SM count as a literal 170, the desktop part, and that literal is wrong twice over in this tree
-on an 82-SM laptop. Fixing it in the sparse-MoE prefill was worth +1.92 pp with t = 19.3 and was
-taken; fixing it in the GDN chunked output measured −0.35 pp with t = −1.5 and was thrown away. The
-difference is not the constant, it is where our fixed prefill chunk lands against it. The MoE
-kernels are persistent, and 510 uniform blocks over 246 slots retire in three waves with the last
-one carrying eighteen blocks; the GDN launcher at our one operating point merely reshuffled a
-single wave. Compute where you actually sit before you believe a diff.
+on an 82-SM laptop. Fixing it in the GDN chunked output measured −0.35 pp with t = −1.5 and was
+thrown away: at our one prefill chunk the launcher merely reshuffled a single wave. Fixing it in
+the sparse-MoE prefill, by sizing the persistent grid to the 246 blocks the device holds, measured
++1.92 pp with t = 19.3 against the old 510 and was taken — and was wrong. A week later upstream's
+grid, sized by work into the thousands with the literal left in its cap, beat ours by another 2%,
+and a device-derived cap measured the same as the literal one. The constant was harmless; the model
+of the kernel behind the fix was not. A win measured against the thing you replaced says nothing
+about the alternative nobody tried.
+
+That same week also showed the cost of triaging a subsystem one PR at a time. Upstream's grid could
+not be taken alone: it stood on five earlier sparse-MoE commits, two of them fixes, none of which
+this fork carried. Taken as a chain they left the directory byte-identical to upstream and added
++7.7% of Ornith prefill on top of the grid, with the model's output hash unchanged. Before judging
+a change, check what it stands on.
 
 **10. Calibrate a probe in the units the system measures, and distrust one nothing fails.** A
 long-context probe sized in bytes came out at 182k and 266k tokens against a 240k and 350k target,

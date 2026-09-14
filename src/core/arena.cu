@@ -99,6 +99,15 @@ void DeviceBuffer::copy_from_host(const void* source, std::size_t count, std::si
     if (err != cudaSuccess) {
         throw std::runtime_error(cuda_error_message("cudaMemcpy host-to-device failed", err));
     }
+    // A pageable host-to-device copy returns once the source has been staged into the driver's
+    // pinned buffer, not once the DMA has landed. Every engine stream here is created
+    // cudaStreamNonBlocking, so a consumer submitted straight after this call is unordered
+    // against the transfer. Settle the default stream before returning.
+    const cudaError_t settled = cudaStreamSynchronize(nullptr);
+    if (settled != cudaSuccess) {
+        throw std::runtime_error(
+            cuda_error_message("host-to-device copy synchronization failed", settled));
+    }
 }
 
 void DeviceBuffer::copy_to_host(void* destination, std::size_t count,

@@ -85,6 +85,8 @@ add_library(ninfer_ops STATIC
   ops/launcher/residual_add.cu
   ops/launcher/rmsnorm.cu
   ops/launcher/rope.cu
+  ops/rmsnorm_rope/rmsnorm_rope.cpp
+  ops/rmsnorm_rope/launch.cu
   ops/launcher/sampling.cu
   ops/launcher/scalar.cu
   ops/launcher/scatter.cu

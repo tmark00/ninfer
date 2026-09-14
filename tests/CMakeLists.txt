@@ -217,6 +217,9 @@ endforeach()
 
 # Stateful, fused, and exact-shape Ops remain central even when the current implementation domain
 # is one checkpoint/device.
+ninfer_add_op_test(ninfer_rmsnorm_rope_test
+  SOURCES ops/test_rmsnorm_rope.cpp
+  LIBRARIES ninfer_ops)
 ninfer_add_op_test(ninfer_gqa_attention_test
   SOURCES ops/test_gqa_attention.cpp
   LIBRARIES ninfer_ops)

@@ -54,15 +54,44 @@ nlohmann::json make_props_stub(const ServeOptions& options,
 // Non-streaming chat completion response body (JSON string). When `reasoning` is
 // non-empty it is attached as `message.reasoning_content` (the DeepSeek/vLLM-style
 // convention consumed by Chatbox, Open WebUI, etc.), leaving `content` = answer.
+// llama.cpp-compatible `timings` for a finished completion. The llama.cpp webui keeps its
+// per-message tokens/second, token count and duration only when the response carries this
+// object; without it the footer shows during generation and disappears at the end. Field
+// names and units follow llama-server and upstream NInfer 550d0ac3.
+struct CompletionTimings {
+    std::uint32_t cache_n          = 0;
+    std::uint32_t prompt_n         = 0;
+    double prompt_ms               = 0.0;
+    double prompt_per_token_ms     = 0.0;
+    double prompt_per_second       = 0.0;
+    std::uint32_t predicted_n      = 0;
+    double predicted_ms            = 0.0;
+    double predicted_per_token_ms  = 0.0;
+    double predicted_per_second    = 0.0;
+    std::uint64_t draft_n          = 0;
+    std::uint64_t draft_n_accepted = 0;
+};
+
+// Prefill produces the first token, so decode rates run over (generated - 1) intervals, the
+// same count the request log divides by. Cached tokens are reported apart and excluded from
+// prompt_n. Non-finite or negative durations are reported as zero.
+CompletionTimings make_completion_timings(std::uint32_t prompt_tokens, std::uint32_t cached_tokens,
+                                          std::uint32_t generated_tokens, double prompt_ms,
+                                          double generation_ms, std::uint64_t draft_tokens = 0,
+                                          std::uint64_t accepted_draft_tokens = 0);
+
+// `timings`, when given, is attached as a top-level object as llama-server does.
 std::string make_chat_completion_response(const std::string& id, const std::string& model,
                                           std::int64_t created, const std::string& content,
                                           const std::string& reasoning, const char* finish_reason,
-                                          const CompletionUsage& usage);
+                                          const CompletionUsage& usage,
+                                          const CompletionTimings* timings = nullptr);
 std::string make_chat_completion_tool_response(const std::string& id, const std::string& model,
                                                std::int64_t created, const std::string& content,
                                                const std::string& reasoning,
                                                const std::vector<ToolCall>& tool_calls,
-                                               const CompletionUsage& usage);
+                                               const CompletionUsage& usage,
+                                               const CompletionTimings* timings = nullptr);
 
 // Streaming SSE event strings ("data: {...}\n\n"). The first chunk carries the
 // assistant role; reasoning chunks carry `reasoning_content` deltas (the <think>
@@ -82,9 +111,11 @@ std::string make_chat_chunk_content(const std::string& id, const std::string& mo
 std::string make_chat_chunk_tool_calls(const std::string& id, const std::string& model,
                                        std::int64_t created,
                                        const std::vector<ToolCall>& tool_calls, bool include_usage);
+// `timings`, when given, rides on the final chunk: that is the chunk the llama.cpp webui
+// stores on the finished message.
 std::string make_chat_chunk_final(const std::string& id, const std::string& model,
                                   std::int64_t created, const char* finish_reason,
-                                  bool include_usage);
+                                  bool include_usage, const CompletionTimings* timings = nullptr);
 // Dedicated usage chunk: `choices: []` with the request's token usage. Emitted
 // only when stream_options.include_usage is true.
 std::string make_chat_chunk_usage(const std::string& id, const std::string& model,

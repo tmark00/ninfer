@@ -820,6 +820,28 @@ int test_chunk_serialization() {
         check(usage_chunk.at("usage").at("prompt_tokens") == 2, "usage chunk prompt_tokens");
     failures += check(usage_chunk.at("usage").at("total_tokens") == 7, "usage chunk total");
 
+    // llama.cpp timings: 100-token prompt with 40 cached, 11 generated over 500 ms of decode.
+    const CompletionTimings timings = make_completion_timings(100, 40, 11, 250.0, 500.0, 30, 20);
+    failures += check(timings.cache_n == 40 && timings.prompt_n == 60, "timings prompt split");
+    failures += check(timings.predicted_per_second == 20.0, "timings decode rate over n-1");
+    failures += check(timings.prompt_per_second == 240.0, "timings prompt rate");
+    const Json timed_final = parse_sse(make_chat_chunk_final("id", "m", 1, "stop", false, &timings));
+    failures += check(timed_final.contains("timings"), "final chunk carries timings");
+    failures += check(timed_final.at("timings").at("predicted_n") == 11, "timings predicted_n");
+    failures += check(timed_final.at("timings").at("predicted_ms") == 500.0, "timings predicted_ms");
+    failures += check(timed_final.at("timings").at("draft_n_accepted") == 20, "timings draft");
+    failures += check(!final_no_usage.contains("timings"), "no timings unless given");
+    const CompletionTimings degenerate = make_completion_timings(5, 9, 0, -1.0, 0.0);
+    failures += check(degenerate.cache_n == 5 && degenerate.prompt_n == 0, "cache clamped to prompt");
+    failures += check(degenerate.prompt_ms == 0.0 && degenerate.predicted_per_second == 0.0,
+                      "timings degenerate spans are zero");
+    const Json degenerate_final =
+        parse_sse(make_chat_chunk_final("id", "m", 1, "stop", false, &degenerate));
+    failures += check(!degenerate_final.at("timings").contains("draft_n"), "draft omitted when zero");
+    const Json timed_response = Json::parse(
+        make_chat_completion_response("id", "m", 1, "ok", "", "stop", usage, &timings));
+    failures += check(timed_response.at("timings").at("prompt_n") == 60, "response timings");
+
     failures += check(sse_done() == "data: [DONE]\n\n", "done sentinel");
     return failures;
 }

@@ -30,6 +30,17 @@
 namespace ninfer::serve {
 namespace {
 
+// Prefill and decode spans measured by the Engine, reported in the llama.cpp dialect so clients
+// such as the bundled webui keep per-message speed after the stream ends.
+CompletionTimings outcome_timings(const GenerationOutcome& outcome) {
+    return make_completion_timings(
+        static_cast<std::uint32_t>(std::max(0, outcome.prompt_tokens)),
+        outcome.metrics.prefix_cache_hit_tokens,
+        static_cast<std::uint32_t>(std::max(0, outcome.completion_tokens)),
+        outcome.metrics.prefill_seconds * 1000.0, outcome.metrics.decode_seconds * 1000.0,
+        outcome.metrics.speculative_draft_tokens, outcome.metrics.speculative_accepted_tokens);
+}
+
 struct StreamingRequest {
     explicit StreamingRequest(PreparedRequest request) : prepared(std::move(request)) {}
 
@@ -853,14 +864,16 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
             });
             log_request_done(log_context, outcome);
             const CompletionUsage usage{outcome.prompt_tokens, outcome.completion_tokens};
+            const CompletionTimings timings = outcome_timings(outcome);
             std::string response_body;
             if (!outcome.tool_calls.empty()) {
                 response_body = make_chat_completion_tool_response(
-                    id, model, created, outcome.text, outcome.reasoning, outcome.tool_calls, usage);
+                    id, model, created, outcome.text, outcome.reasoning, outcome.tool_calls, usage,
+                    &timings);
             } else {
                 response_body = make_chat_completion_response(
                     id, model, created, outcome.text, outcome.reasoning,
-                    finish_reason_wire(outcome.finish_reason), usage);
+                    finish_reason_wire(outcome.finish_reason), usage, &timings);
             }
             set_owned_content(res, std::move(response_body), prepared.lifetime);
         } catch (const std::exception& e) {
@@ -909,6 +922,7 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
 
                 const GenerationOutcome outcome = service_->run(stream->prepared, &output);
                 log_request_done(log_context, outcome);
+                const CompletionTimings timings  = outcome_timings(outcome);
                 const std::string_view remaining = unstreamed_content(outcome);
                 if (!outcome.tool_calls.empty()) {
                     if (!remaining.empty()) {
@@ -922,7 +936,8 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
                                           id, model, created, outcome.tool_calls, include_usage));
                     write_stream_item(
                         sink, *stream,
-                        make_chat_chunk_final(id, model, created, "tool_calls", include_usage));
+                        make_chat_chunk_final(id, model, created, "tool_calls", include_usage,
+                                              &timings));
                 } else {
                     if (tool_capable && !remaining.empty()) {
                         write_stream_item(sink, *stream,
@@ -934,7 +949,7 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
                         sink, *stream,
                         make_chat_chunk_final(id, model, created,
                                               finish_reason_wire(outcome.finish_reason),
-                                              include_usage));
+                                              include_usage, &timings));
                 }
                 if (include_usage) {
                     const CompletionUsage usage{outcome.prompt_tokens, outcome.completion_tokens};

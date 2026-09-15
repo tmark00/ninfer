@@ -207,6 +207,12 @@ int exercise_rewrite_checkpoints(ninfer::Engine& engine) {
         result.stop.include_model_defaults       = false;
         return result;
     };
+    // A replay without preserve-thinking reclassifies the snapshot as a turn closure, so later
+    // hits may restore either kind; what matters is that a checkpoint is restored at all.
+    auto restored = [](const ninfer::GenerationResult& result) {
+        return result.prefix_reuse_path == ninfer::PrefixReusePath::RestoreResponseCheckpoint ||
+               result.prefix_reuse_path == ninfer::PrefixReusePath::RestoreTurnCheckpoint;
+    };
 
     const ninfer::GenerationResult first =
         engine.generate(engine.prepare(input_with_history(0, true)), options(false));
@@ -218,8 +224,7 @@ int exercise_rewrite_checkpoints(ninfer::Engine& engine) {
 
     const ninfer::GenerationResult exact_replay =
         engine.generate(engine.prepare(input_with_history(0, false)), options(true));
-    if (exact_replay.generated_token_ids.size() != 4 ||
-        exact_replay.prefix_reuse_path != ninfer::PrefixReusePath::RestoreResponseCheckpoint ||
+    if (exact_replay.generated_token_ids.size() != 4 || !restored(exact_replay) ||
         exact_replay.reused_prompt_tokens == 0) {
         std::cerr << "prompt-frontier response checkpoint was not restored on an exact replay\n";
         return 1;
@@ -227,8 +232,7 @@ int exercise_rewrite_checkpoints(ninfer::Engine& engine) {
 
     const ninfer::GenerationResult first_replay =
         engine.generate(engine.prepare(input_with_history(1, true)), options(true));
-    if (first_replay.generated_token_ids.size() != 4 ||
-        first_replay.prefix_reuse_path != ninfer::PrefixReusePath::RestoreResponseCheckpoint ||
+    if (first_replay.generated_token_ids.size() != 4 || !restored(first_replay) ||
         first_replay.reused_prompt_tokens == 0) {
         std::cerr << "normalized first response did not restore its response checkpoint: path="
                   << static_cast<int>(first_replay.prefix_reuse_path)
@@ -238,8 +242,7 @@ int exercise_rewrite_checkpoints(ninfer::Engine& engine) {
 
     const ninfer::GenerationResult second_replay =
         engine.generate(engine.prepare(input_with_history(2, true)), options(true));
-    if (second_replay.generated_token_ids.size() != 4 ||
-        second_replay.prefix_reuse_path != ninfer::PrefixReusePath::RestoreResponseCheckpoint ||
+    if (second_replay.generated_token_ids.size() != 4 || !restored(second_replay) ||
         second_replay.reused_prompt_tokens <= first_replay.reused_prompt_tokens) {
         std::cerr << "rolling response checkpoint did not advance across the tool loop: first="
                   << first_replay.reused_prompt_tokens
@@ -249,8 +252,7 @@ int exercise_rewrite_checkpoints(ninfer::Engine& engine) {
 
     const ninfer::GenerationResult mode_change =
         engine.generate(engine.prepare(input_with_history(2, false)), options(true));
-    if (mode_change.generated_token_ids.size() != 4 ||
-        mode_change.prefix_reuse_path != ninfer::PrefixReusePath::RestoreResponseCheckpoint ||
+    if (mode_change.generated_token_ids.size() != 4 || !restored(mode_change) ||
         mode_change.reused_prompt_tokens == 0) {
         std::cerr << "preserve-thinking policy change discarded a compatible response checkpoint: "
                   << "path=" << static_cast<int>(mode_change.prefix_reuse_path)
@@ -264,8 +266,7 @@ int exercise_rewrite_checkpoints(ninfer::Engine& engine) {
     rewritten.messages[3].reasoning_content = "Beta is the key the alpha result names.";
     const ninfer::GenerationResult older =
         engine.generate(engine.prepare(rewritten), options(true));
-    if (older.generated_token_ids.size() != 4 ||
-        older.prefix_reuse_path != ninfer::PrefixReusePath::RestoreResponseCheckpoint ||
+    if (older.generated_token_ids.size() != 4 || !restored(older) ||
         older.reused_prompt_tokens != second_replay.reused_prompt_tokens) {
         std::cerr << "rewritten response did not fall back to the previous checkpoint: path="
                   << static_cast<int>(older.prefix_reuse_path)
@@ -393,7 +394,14 @@ int exercise_vision(ninfer::Engine& engine) {
         engine.prepare(appended_media_input(image_bytes, first, reused, second_image)),
         options(false));
     if (baseline.generated_token_ids != appended.generated_token_ids) {
-        std::cerr << "multimodal prefix reuse changed greedy output\n";
+        std::cerr << "multimodal prefix reuse changed greedy output: path="
+                  << static_cast<int>(appended.prefix_reuse_path)
+                  << " reused=" << appended.reused_prompt_tokens
+                  << " prompt=" << appended.prompt.prompt_tokens << " reuse_tokens=";
+        for (const ninfer::TokenId id : appended.generated_token_ids) { std::cerr << id << ' '; }
+        std::cerr << "cold_tokens=";
+        for (const ninfer::TokenId id : baseline.generated_token_ids) { std::cerr << id << ' '; }
+        std::cerr << '\n';
         return 1;
     }
 

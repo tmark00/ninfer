@@ -284,8 +284,11 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
         SequenceState& sequence = sequences[lane];
         sequence.lane           = lane;
         sequence.tail_hidden    = tail_hidden_store.slice(1, static_cast<std::int32_t>(lane), 1);
-        sequence.rewrite_checkpoint_hidden =
-            rewrite_checkpoint_hidden_store.slice(1, static_cast<std::int32_t>(lane), 1);
+        for (std::uint32_t index = 0; index < LinearStateSlots::kRewriteCheckpoints; ++index) {
+            sequence.rewrite_checkpoint_hidden[index] = rewrite_checkpoint_hidden_store.slice(
+                1, static_cast<std::int32_t>(lane * LinearStateSlots::kRewriteCheckpoints + index),
+                1);
+        }
         sequence.ledger.reserve(static_cast<std::size_t>(capacity) + 1ULL);
         sequence.prefix_identity.reserve(static_cast<std::size_t>(capacity) + 1ULL);
     }
@@ -459,29 +462,44 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
                                           request_plan.reuse_base))) {
         throw std::logic_error("planned resident prefix is no longer reusable");
     }
+    const std::uint32_t checkpoint_capacity = rewrite_checkpoint_capacity(speculative_backend);
+    if (request_plan.reuse_checkpoint_index >= checkpoint_capacity ||
+        request_plan.rewrite_checkpoint_index >= checkpoint_capacity) {
+        throw std::logic_error("planned rewrite checkpoint index is out of range");
+    }
+    const RewriteCheckpoint& restored =
+        sequence.rewrite_checkpoints[request_plan.reuse_checkpoint_index];
+    const RewriteCheckpoint& retained =
+        sequence.rewrite_checkpoints[request_plan.rewrite_checkpoint_index];
     if (is_rewrite_checkpoint_restore(request_plan.reuse) &&
-        (!sequence.rewrite_checkpoint.valid ||
-         sequence.rewrite_checkpoint.frontier != request_plan.reuse_base ||
-         request_plan.reuse != restore_path(sequence.rewrite_checkpoint.kind))) {
+        (!restored.valid || restored.frontier != request_plan.reuse_base ||
+         request_plan.reuse != restore_path(restored.kind))) {
         throw std::logic_error("planned rewrite checkpoint is unavailable");
     }
     if (request_plan.rewrite_checkpoint_action == RewriteCheckpointAction::KeepExisting &&
-        (!prompt.identity.rewrite_checkpoint || !sequence.rewrite_checkpoint.valid ||
-         sequence.rewrite_checkpoint.kind != prompt.identity.rewrite_checkpoint->kind ||
-         sequence.rewrite_checkpoint.frontier != prompt.identity.rewrite_checkpoint->frontier ||
+        (!prompt.identity.rewrite_checkpoint || !retained.valid ||
+         retained.kind != prompt.identity.rewrite_checkpoint->kind ||
+         retained.frontier != prompt.identity.rewrite_checkpoint->frontier ||
+         retained.frontier > request_plan.reuse_base ||
          request_plan.reuse == ReusePath::FullReset ||
          !qwen3_6::detail::prefix_matches(prompt, sequence.ledger, sequence.prefix_identity,
-                                          sequence.rewrite_checkpoint.frontier))) {
+                                          retained.frontier))) {
         throw std::logic_error("planned rewrite checkpoint retention is unavailable");
     }
     if (request_plan.rewrite_checkpoint_action == RewriteCheckpointAction::ReclassifyExisting &&
-        (!prompt.identity.rewrite_checkpoint || !sequence.rewrite_checkpoint.valid ||
-         sequence.rewrite_checkpoint.kind == prompt.identity.rewrite_checkpoint->kind ||
-         sequence.rewrite_checkpoint.frontier != prompt.identity.rewrite_checkpoint->frontier ||
+        (!prompt.identity.rewrite_checkpoint || !retained.valid ||
+         retained.kind == prompt.identity.rewrite_checkpoint->kind ||
+         retained.frontier != prompt.identity.rewrite_checkpoint->frontier ||
+         retained.frontier > request_plan.reuse_base ||
          request_plan.reuse == ReusePath::FullReset ||
          !qwen3_6::detail::prefix_matches(prompt, sequence.ledger, sequence.prefix_identity,
-                                          sequence.rewrite_checkpoint.frontier))) {
+                                          retained.frontier))) {
         throw std::logic_error("planned rewrite checkpoint reclassification is unavailable");
+    }
+    if (request_plan.rewrite_checkpoint_action == RewriteCheckpointAction::CaptureNew &&
+        is_rewrite_checkpoint_restore(request_plan.reuse) &&
+        request_plan.rewrite_checkpoint_index == request_plan.reuse_checkpoint_index) {
+        throw std::logic_error("planned rewrite checkpoint capture overwrites the restored one");
     }
     if (request_plan.rewrite_checkpoint_action == RewriteCheckpointAction::CaptureNew &&
         (!request_plan.rewrite_checkpoint_capture || !prompt.identity.rewrite_checkpoint ||
@@ -572,10 +590,14 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
             resize_sequence_kv_entitlement(sequence, request_plan.text_kv_page_entitlement,
                                            request_plan.backend_kv_page_entitlement);
             decoder->linear_attention.copy_slot(
-                LinearStateSlots::rewrite_checkpoint_state_slot(sequence.lane, max_concurrency),
+                LinearStateSlots::rewrite_checkpoint_state_slot(
+                    sequence.lane, max_concurrency, request_plan.reuse_checkpoint_index),
                 LinearStateSlots::current_state_slot(sequence.lane, max_concurrency),
                 device.stream);
-            if (base == prompt_tokens) { copy_tail(sequence, sequence.rewrite_checkpoint_hidden); }
+            if (base == prompt_tokens) {
+                copy_tail(sequence,
+                          sequence.rewrite_checkpoint_hidden[request_plan.reuse_checkpoint_index]);
+            }
             sequence.ledger.resize(base);
         } else {
             throw std::logic_error("request plan has an invalid prefix reuse path");
@@ -594,12 +616,22 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
         sequence.rope_delta = prompt.rope_delta;
         set_device_i32(io.rope_delta, sequence.rope_delta);
 
-        if (request_plan.rewrite_checkpoint_action == RewriteCheckpointAction::Drop ||
-            request_plan.rewrite_checkpoint_action == RewriteCheckpointAction::CaptureNew) {
-            sequence.rewrite_checkpoint = {};
-        } else if (request_plan.rewrite_checkpoint_action ==
-                   RewriteCheckpointAction::ReclassifyExisting) {
-            sequence.rewrite_checkpoint.kind = prompt.identity.rewrite_checkpoint->kind;
+        // A snapshot past the reuse base describes tokens this request is about to overwrite.
+        for (std::uint32_t index = 0; index < LinearStateSlots::kRewriteCheckpoints; ++index) {
+            RewriteCheckpoint& checkpoint = sequence.rewrite_checkpoints[index];
+            const bool survives = request_plan.reuse != ReusePath::FullReset &&
+                                  index < checkpoint_capacity && checkpoint.frontier <= base;
+            const bool overwritten =
+                request_plan.rewrite_checkpoint_action == RewriteCheckpointAction::CaptureNew &&
+                index == request_plan.rewrite_checkpoint_index;
+            if (!survives || overwritten ||
+                request_plan.rewrite_checkpoint_action == RewriteCheckpointAction::Drop) {
+                checkpoint = {};
+            }
+        }
+        if (request_plan.rewrite_checkpoint_action == RewriteCheckpointAction::ReclassifyExisting) {
+            sequence.rewrite_checkpoints[request_plan.rewrite_checkpoint_index].kind =
+                prompt.identity.rewrite_checkpoint->kind;
         }
         request.timings            = {};
         request.pending            = {};
@@ -648,6 +680,8 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
             .prepare_mtp                = request_plan.prepare_mtp,
             .reuse                      = request_plan.reuse,
             .mtp_bridge                 = request_plan.mtp_bridge,
+            .reuse_checkpoint           = request_plan.reuse_checkpoint_index,
+            .capture_checkpoint         = request_plan.rewrite_checkpoint_index,
         };
         request.prefill.emplace(std::move(prefill));
         auto& staged = *request.prefill;
@@ -971,7 +1005,7 @@ void ProgramImplCore::clear_lane(SequenceState& sequence, RequestControl& reques
     sequence.mtp_draft_count         = 0;
     sequence.tail_hidden_valid       = false;
     sequence.retained                = false;
-    sequence.rewrite_checkpoint      = {};
+    sequence.rewrite_checkpoints     = {};
     request.pending                  = {};
     request.mtp_signal.reset();
 }
@@ -1660,9 +1694,10 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
             staged.cursor,
             static_cast<const ops::SamplingConfig*>(
                 sampling_config.slice(1, static_cast<std::int32_t>(sequence.lane), 1).data),
-            &sequence.rewrite_checkpoint_hidden,
+            &sequence.rewrite_checkpoint_hidden[staged.capture_checkpoint],
             LinearStateSlots::current_state_slot(sequence.lane, max_concurrency),
-            LinearStateSlots::rewrite_checkpoint_state_slot(sequence.lane, max_concurrency),
+            LinearStateSlots::rewrite_checkpoint_state_slot(sequence.lane, max_concurrency,
+                                                            staged.capture_checkpoint),
             staged.initial_mtp_extent,
             dflash_host_ingress};
 
@@ -1672,9 +1707,10 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
                 throw std::logic_error("staged MTP bridge is outside the reusable suffix");
             }
             mark_workspace_usage(workspace_plan.mtp_prefill);
-            const Tensor& previous_hidden = is_rewrite_checkpoint_restore(staged.reuse)
-                                                ? sequence.rewrite_checkpoint_hidden
-                                                : sequence.tail_hidden;
+            const Tensor& previous_hidden =
+                is_rewrite_checkpoint_restore(staged.reuse)
+                    ? sequence.rewrite_checkpoint_hidden[staged.reuse_checkpoint]
+                    : sequence.tail_hidden;
             const schedule::MtpBridgeInput bridge{
                 .previous_hidden = &previous_hidden,
                 .position        = checked_i32(staged.base - 1, "MTP bridge position"),
@@ -1783,7 +1819,8 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
         const double vision_seconds = staged.vision ? staged.vision->elapsed_seconds() : 0.0;
         const std::optional<RewriteCheckpointSpec> rewrite_checkpoint_capture =
             staged.rewrite_checkpoint_capture;
-        const std::uint32_t prompt_tokens = staged.prompt_tokens;
+        const std::uint32_t prompt_tokens      = staged.prompt_tokens;
+        const std::uint32_t capture_checkpoint = staged.capture_checkpoint;
 
         validate_licensed_tokens(std::span<const TokenId>(host_tokens, 1));
         if (sequence.ledger.size() != prompt_tokens) {
@@ -1828,7 +1865,7 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
                  sequence.dflash_context_frontier < frontier)) {
                 throw std::logic_error("rewrite checkpoint has no complete DFlash prefix");
             }
-            sequence.rewrite_checkpoint = RewriteCheckpoint{
+            sequence.rewrite_checkpoints[capture_checkpoint] = RewriteCheckpoint{
                 .valid = true, .kind = rewrite_checkpoint_capture->kind, .frontier = frontier};
         }
 

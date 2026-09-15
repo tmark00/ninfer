@@ -240,7 +240,9 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
         builder, DType::BF16, {TextConfig::hidden, static_cast<std::int32_t>(plan.max_concurrency)},
         "tail hidden");
     out.rewrite_checkpoint_hidden = add_tensor(
-        builder, DType::BF16, {TextConfig::hidden, static_cast<std::int32_t>(plan.max_concurrency)},
+        builder, DType::BF16,
+        {TextConfig::hidden, static_cast<std::int32_t>(LinearStateSlots::kRewriteCheckpoints *
+                                                       plan.max_concurrency)},
         "rewrite checkpoint hidden");
     out.bytes = builder.finish(kArenaAlign, "persistent layout");
     out.kv_payload_bytes =

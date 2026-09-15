@@ -204,6 +204,7 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
     plan->text_kv_page_entitlement    = base.text_kv_page_entitlement;
     plan->backend_kv_page_entitlement = base.backend_kv_page_entitlement;
 
+    const std::uint32_t checkpoint_capacity = rewrite_checkpoint_capacity(speculative_backend);
     if (base.allow_prefix_reuse && prompt.identity.reusable && sequence.retained) {
         const bool dflash_append_ready =
             speculative_backend != SpeculativeBackend::DFlash ||
@@ -213,13 +214,34 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
                                             sequence.execution_frontier)) {
             plan->reuse      = ReusePath::AppendAtFrontier;
             plan->reuse_base = sequence.execution_frontier;
-        } else if (sequence.rewrite_checkpoint.valid && sequence.rewrite_checkpoint.frontier != 0 &&
-                   sequence.rewrite_checkpoint.frontier <= prompt.token_ids.size() &&
-                   qwen3_6::detail::prefix_matches(prompt, sequence.ledger,
-                                                   sequence.prefix_identity,
-                                                   sequence.rewrite_checkpoint.frontier)) {
-            plan->reuse      = restore_path(sequence.rewrite_checkpoint.kind);
-            plan->reuse_base = sequence.rewrite_checkpoint.frontier;
+        } else {
+            // Take the deepest checkpoint the prompt still agrees with. A client that rewrites
+            // an older turn misses the newest boundary but can still land on the one before it.
+            const auto backend_ready = [&](std::uint32_t frontier) {
+                if (speculative_backend == SpeculativeBackend::Mtp) {
+                    return decoder->mtp_cache() != nullptr && sequence.mtp_kv_valid >= frontier - 1;
+                }
+                if (speculative_backend == SpeculativeBackend::DFlash) {
+                    return dflash && sequence.kv && sequence.kv->backend &&
+                           sequence.dflash_context_frontier >= frontier;
+                }
+                return true;
+            };
+            for (std::uint32_t index = 0; index < checkpoint_capacity; ++index) {
+                const RewriteCheckpoint& checkpoint = sequence.rewrite_checkpoints[index];
+                if (!checkpoint.valid || checkpoint.frontier == 0 ||
+                    checkpoint.frontier <= plan->reuse_base ||
+                    checkpoint.frontier > prompt.token_ids.size() ||
+                    !backend_ready(checkpoint.frontier) ||
+                    !qwen3_6::detail::prefix_matches(prompt, sequence.ledger,
+                                                     sequence.prefix_identity,
+                                                     checkpoint.frontier)) {
+                    continue;
+                }
+                plan->reuse                  = restore_path(checkpoint.kind);
+                plan->reuse_base             = checkpoint.frontier;
+                plan->reuse_checkpoint_index = index;
+            }
         }
     }
 
@@ -246,20 +268,49 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
     }
 
     const std::optional<RewriteCheckpointSpec>& desired = base.rewrite_checkpoint;
-    const bool existing_checkpoint_matches =
-        desired && plan->reuse != ReusePath::FullReset && sequence.rewrite_checkpoint.valid &&
-        sequence.rewrite_checkpoint.frontier == desired->frontier &&
-        qwen3_6::detail::prefix_matches(prompt, sequence.ledger, sequence.prefix_identity,
-                                        desired->frontier);
+    // Only snapshots at or before the reuse base outlive this request; the rest describe tokens
+    // that its prefill overwrites.
+    const auto survives = [&](std::uint32_t index) {
+        const RewriteCheckpoint& checkpoint = sequence.rewrite_checkpoints[index];
+        return plan->reuse != ReusePath::FullReset && checkpoint.valid &&
+               checkpoint.frontier <= plan->reuse_base;
+    };
+    std::optional<std::uint32_t> existing_checkpoint;
+    for (std::uint32_t index = 0; desired && index < checkpoint_capacity; ++index) {
+        if (survives(index) && sequence.rewrite_checkpoints[index].frontier == desired->frontier &&
+            qwen3_6::detail::prefix_matches(prompt, sequence.ledger, sequence.prefix_identity,
+                                            desired->frontier)) {
+            existing_checkpoint = index;
+            break;
+        }
+    }
     if (!desired) {
         plan->rewrite_checkpoint_action = RewriteCheckpointAction::Drop;
-    } else if (existing_checkpoint_matches) {
-        plan->rewrite_checkpoint_action = sequence.rewrite_checkpoint.kind == desired->kind
-                                              ? RewriteCheckpointAction::KeepExisting
-                                              : RewriteCheckpointAction::ReclassifyExisting;
+    } else if (existing_checkpoint) {
+        plan->rewrite_checkpoint_index = *existing_checkpoint;
+        plan->rewrite_checkpoint_action =
+            sequence.rewrite_checkpoints[*existing_checkpoint].kind == desired->kind
+                ? RewriteCheckpointAction::KeepExisting
+                : RewriteCheckpointAction::ReclassifyExisting;
     } else if (desired->frontier > plan->reuse_base) {
         plan->rewrite_checkpoint_action  = RewriteCheckpointAction::CaptureNew;
         plan->rewrite_checkpoint_capture = desired;
+        // Overwrite a snapshot that dies anyway; otherwise evict the oldest survivor. The
+        // restored snapshot sits exactly at the reuse base, so it is never the oldest of two.
+        std::optional<std::uint32_t> victim;
+        for (std::uint32_t index = 0; index < checkpoint_capacity && !victim; ++index) {
+            if (!survives(index)) { victim = index; }
+        }
+        if (!victim) {
+            victim = 0;
+            for (std::uint32_t index = 1; index < checkpoint_capacity; ++index) {
+                if (sequence.rewrite_checkpoints[index].frontier <
+                    sequence.rewrite_checkpoints[*victim].frontier) {
+                    victim = index;
+                }
+            }
+        }
+        plan->rewrite_checkpoint_index = *victim;
     } else {
         // The selected continuation state is already past the desired boundary. It remains a
         // valid hit; do not replay an otherwise reusable prefix merely to materialize an older

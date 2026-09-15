@@ -83,6 +83,10 @@ struct RequestPlanImpl<NINFER_QWEN36_VARIANT> {
     NINFER_QWEN36_RUNTIME_NS::RewriteCheckpointAction rewrite_checkpoint_action =
         NINFER_QWEN36_RUNTIME_NS::RewriteCheckpointAction::Drop;
     std::optional<qwen3_6::RewriteCheckpointSpec> rewrite_checkpoint_capture;
+    // Checkpoint restored by a Restore*Checkpoint reuse path.
+    std::uint32_t reuse_checkpoint_index = 0;
+    // Checkpoint kept or reclassified, or the one overwritten by CaptureNew.
+    std::uint32_t rewrite_checkpoint_index = 0;
     ops::SamplingConfig sampling;
     std::uint32_t text_kv_page_entitlement    = 0;
     std::uint32_t backend_kv_page_entitlement = 0;
@@ -124,6 +128,12 @@ struct RewriteCheckpoint {
     std::uint32_t frontier     = 0;
 };
 
+// DFlash keeps a single local-cache snapshot per lane, so it retains one checkpoint.
+[[nodiscard]] constexpr std::uint32_t
+rewrite_checkpoint_capacity(SpeculativeBackend backend) noexcept {
+    return backend == SpeculativeBackend::DFlash ? 1U : LinearStateSlots::kRewriteCheckpoints;
+}
+
 struct SequenceKVBundle {
     PagedKVAllocation text;
     std::optional<PagedKVAllocation> backend;
@@ -155,7 +165,7 @@ struct DecodeGraphFamily {
 struct SequenceState {
     std::optional<SequenceKVBundle> kv;
     Tensor tail_hidden;
-    Tensor rewrite_checkpoint_hidden;
+    std::array<Tensor, LinearStateSlots::kRewriteCheckpoints> rewrite_checkpoint_hidden;
     std::uint32_t lane = 0;
 
     std::uint32_t execution_frontier = 0;
@@ -170,7 +180,7 @@ struct SequenceState {
     std::uint32_t mtp_draft_count = 0;
     bool tail_hidden_valid        = false;
     bool retained                 = false;
-    RewriteCheckpoint rewrite_checkpoint;
+    std::array<RewriteCheckpoint, LinearStateSlots::kRewriteCheckpoints> rewrite_checkpoints;
 };
 
 // Request/round control is not retained with a reusable SequenceState. A later concurrent Engine
@@ -198,6 +208,8 @@ struct RequestControl {
         bool prepare_mtp                 = false;
         ReusePath reuse                  = ReusePath::FullReset;
         MtpBridgeMode mtp_bridge         = MtpBridgeMode::None;
+        std::uint32_t reuse_checkpoint   = 0;
+        std::uint32_t capture_checkpoint = 0;
     };
 
     std::optional<Prefill> prefill;

@@ -47,6 +47,9 @@ ninfer::PromptInput chinese_chat(bool enable_thinking) {
 }
 
 int exercise_registered_frontend(const ninfer::Engine& engine) {
+    // The goldens belong to the Qwen3.6 tokenizer and template; Qwen3.8 artifacts render
+    // differently.
+    if (engine.load_summary().target != "qwen3_6_27b") { return 0; }
     if (engine.count_tokens(chinese_chat(true)) != 16) {
         std::cerr << "registered tokenizer/chat template changed the thinking prompt golden\n";
         return 1;
@@ -254,6 +257,28 @@ int exercise_rewrite_checkpoints(ninfer::Engine& engine) {
                   << " reused=" << mode_change.reused_prompt_tokens << '\n';
         return 1;
     }
+
+    // A client that rewrites the reasoning of an earlier response misses the newest checkpoint,
+    // which lies after it. The checkpoint before that response must still be restored.
+    ninfer::PromptInput rewritten           = input_with_history(2, true);
+    rewritten.messages[3].reasoning_content = "Beta is the key the alpha result names.";
+    const ninfer::GenerationResult older =
+        engine.generate(engine.prepare(rewritten), options(true));
+    if (older.generated_token_ids.size() != 4 ||
+        older.prefix_reuse_path != ninfer::PrefixReusePath::RestoreResponseCheckpoint ||
+        older.reused_prompt_tokens != second_replay.reused_prompt_tokens) {
+        std::cerr << "rewritten response did not fall back to the previous checkpoint: path="
+                  << static_cast<int>(older.prefix_reuse_path)
+                  << " reused=" << older.reused_prompt_tokens
+                  << " expected=" << second_replay.reused_prompt_tokens << '\n';
+        return 1;
+    }
+    const ninfer::GenerationResult cold =
+        engine.generate(engine.prepare(rewritten), options(false));
+    if (cold.generated_token_ids != older.generated_token_ids) {
+        std::cerr << "previous-checkpoint restore changed greedy output\n";
+        return 1;
+    }
     return 0;
 }
 
@@ -447,7 +472,7 @@ int exercise_vision(ninfer::Engine& engine) {
 
 int verify_loaded_product(const ninfer::Engine& engine) {
     const ninfer::LoadSummary load = engine.load_summary();
-    if (load.target != "qwen3_6_27b" ||
+    if ((load.target != "qwen3_6_27b" && load.target != "qwen3_8_27b") ||
         (load.weights_id != "groupwise-int" && load.weights_id != "nvfp4") ||
         load.host_to_device_bytes == 0 || load.artifact_bytes_read < load.host_to_device_bytes) {
         std::cerr << "Engine construction has an invalid load summary: target=" << load.target

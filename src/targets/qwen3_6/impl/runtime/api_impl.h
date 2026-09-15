@@ -205,6 +205,11 @@ bool Program<Variant>::has_retained_lane(std::uint32_t lane) const noexcept {
 }
 
 template <>
+std::uint32_t Program<Variant>::retained_prefix_tokens(std::uint32_t lane) const noexcept {
+    return impl_->retained_prefix_tokens(lane);
+}
+
+template <>
 void Program<Variant>::evict_retained_lane(std::uint32_t lane) noexcept {
     impl_->evict_retained_lane(lane);
 }

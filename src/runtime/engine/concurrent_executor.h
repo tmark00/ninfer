@@ -696,19 +696,28 @@ private:
         request->lane_plan_versions[lane] = lane_plan_versions_[lane];
     }
 
+    // Prefill a lane saves minus the retained prefix it destroys. Ranking by reuse alone sent a
+    // request unrelated to the kept conversation (reuse 0 everywhere, or only a shared system
+    // prompt) to lane 0 and overwrote that conversation while another lane sat empty.
+    [[nodiscard]] std::int64_t lane_admission_value(std::uint32_t lane, const Plan& plan) const {
+        const std::int64_t reuse    = plan.summary().reusable_prompt_tokens;
+        const std::int64_t retained = instance_.program->retained_prefix_tokens(lane);
+        return reuse - std::max<std::int64_t>(0, retained - reuse);
+    }
+
     [[nodiscard]] std::optional<LaneChoice>
     find_admission_lane(const std::shared_ptr<Request>& request) {
         std::optional<LaneChoice> selected;
-        std::uint32_t selected_reuse = 0;
+        std::int64_t selected_value = 0;
         for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
             if (slots_[lane] != nullptr) { continue; }
             ensure_lane_plan(request, lane);
-            const Plan& plan          = *request->lane_plans[lane];
-            const std::uint32_t reuse = plan.summary().reusable_prompt_tokens;
+            const Plan& plan         = *request->lane_plans[lane];
+            const std::int64_t value = lane_admission_value(lane, plan);
             if (instance_.program->can_admit_lane(lane, plan) &&
-                (!selected || reuse > selected_reuse)) {
+                (!selected || value > selected_value)) {
                 selected       = LaneChoice{.lane = lane};
-                selected_reuse = reuse;
+                selected_value = value;
             }
         }
         if (selected) { return selected; }
@@ -716,15 +725,15 @@ private:
         for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
             if (slots_[lane] != nullptr) { continue; }
             ensure_lane_plan(request, lane);
-            const Plan& plan          = *request->lane_plans[lane];
-            const std::uint32_t reuse = plan.summary().reusable_prompt_tokens;
+            const Plan& plan         = *request->lane_plans[lane];
+            const std::int64_t value = lane_admission_value(lane, plan);
             if (instance_.program->can_admit_lane_after_retained_eviction(lane, plan) &&
-                (!selected || reuse > selected_reuse)) {
+                (!selected || value > selected_value)) {
                 selected = LaneChoice{
                     .lane           = lane,
                     .evict_retained = true,
                 };
-                selected_reuse = reuse;
+                selected_value = value;
             }
         }
         return selected;

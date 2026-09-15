@@ -502,7 +502,57 @@ int verify_loaded_product(const ninfer::Engine& engine) {
 
 } // namespace
 
+// With a free lane available, a short request unrelated to the retained conversation (sharing
+// only its first tokens) must not be admitted onto the conversation's lane and overwrite it.
+int exercise_lane_choice(const char* artifact) {
+    ninfer::EngineOptions options = engine_options(artifact);
+    options.max_concurrency       = 2;
+    options.enable_vision         = false;
+    ninfer::Engine engine(options);
+
+    ninfer::RequestOptions request;
+    request.execution.requested_output_tokens = 5;
+    request.execution.sampling.temperature    = 0.0F;
+    request.execution.allow_prefix_reuse      = true;
+    request.stop.include_model_defaults       = false;
+
+    std::vector<ninfer::TokenId> conversation{248045, 846, 198};
+    for (int index = 0; index < 600; ++index) {
+        conversation.push_back(static_cast<ninfer::TokenId>(1000 + (index * 37) % 5000));
+    }
+    const ninfer::GenerationResult first =
+        engine.generate(engine.prepare_tokens(conversation), request);
+    if (first.generated_token_ids.size() != 5) {
+        std::cerr << "lane-choice conversation did not generate five tokens\n";
+        return 1;
+    }
+
+    const std::vector<ninfer::TokenId> unrelated{248045, 846, 198, 5834, 248046, 198};
+    const ninfer::GenerationResult side =
+        engine.generate(engine.prepare_tokens(unrelated), request);
+    if (side.generated_token_ids.size() != 5) {
+        std::cerr << "lane-choice side request did not generate five tokens\n";
+        return 1;
+    }
+
+    std::vector<ninfer::TokenId> continuation = conversation;
+    continuation.insert(continuation.end(), first.generated_token_ids.begin(),
+                        first.generated_token_ids.end());
+    continuation.push_back(198);
+    const ninfer::GenerationResult resumed =
+        engine.generate(engine.prepare_tokens(continuation), request);
+    const std::uint32_t expected =
+        static_cast<std::uint32_t>(conversation.size() + first.generated_token_ids.size() - 1);
+    if (resumed.reused_prompt_tokens != expected) {
+        std::cerr << "side request evicted the retained conversation: reused="
+                  << resumed.reused_prompt_tokens << " expected=" << expected << '\n';
+        return 1;
+    }
+    return 0;
+}
+
 int exercise_artifact(const char* artifact) {
+    if (const int result = exercise_lane_choice(artifact); result != 0) { return result; }
     ninfer::Engine engine(engine_options(artifact));
     if (const int result = verify_loaded_product(engine); result != 0) { return result; }
     if (const int result = exercise_registered_frontend(engine); result != 0) { return result; }

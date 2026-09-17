@@ -47,6 +47,13 @@ CHUNK = 8 * 1024 * 1024
 WRITEBACK = 64 * 1024 * 1024
 
 
+# Page-cache hints and data-only sync are POSIX; on Windows the hint is skipped and the sync
+# falls back to a full fsync, which flushes the same bytes.
+fadvise = getattr(os, "posix_fadvise", lambda *args: None)
+FADV_DONTNEED = getattr(os, "POSIX_FADV_DONTNEED", 0)
+datasync = getattr(os, "fdatasync", os.fsync)
+
+
 def align(value, amount=4096):
     return (value + amount - 1) // amount * amount
 
@@ -828,11 +835,11 @@ def upgrade(input_path, output_path):
                             )
                             if not chunk:
                                 raise ValueError("v2 payload ended prematurely")
-                            os.posix_fadvise(
+                            fadvise(
                                 source.fileno(),
                                 source.tell() - len(chunk),
                                 len(chunk),
-                                os.POSIX_FADV_DONTNEED,
+                                FADV_DONTNEED,
                             )
                         elif cursor < template_offset:
                             chunk = bytes(min(remaining, template_offset - cursor))
@@ -845,15 +852,15 @@ def upgrade(input_path, output_path):
                         pending += len(chunk)
                         if pending >= WRITEBACK:
                             output.flush()
-                            os.fdatasync(output.fileno())
-                            os.posix_fadvise(
-                                output.fileno(), 0, 0, os.POSIX_FADV_DONTNEED
+                            datasync(output.fileno())
+                            fadvise(
+                                output.fileno(), 0, 0, FADV_DONTNEED
                             )
                             pending = 0
                     output.flush()
-                    os.fdatasync(output.fileno())
-                    os.posix_fadvise(output.fileno(), 0, 0, os.POSIX_FADV_DONTNEED)
-            os.posix_fadvise(source.fileno(), 0, 0, os.POSIX_FADV_DONTNEED)
+                    datasync(output.fileno())
+                    fadvise(output.fileno(), 0, 0, FADV_DONTNEED)
+            fadvise(source.fileno(), 0, 0, FADV_DONTNEED)
         for index in [*range(1, len(targets)), 0]:
             os.link(temporary[index], targets[index])
             published.append(targets[index])

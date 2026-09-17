@@ -1,5 +1,6 @@
 #pragma once
 
+#include "core/wide_uint.h"
 #include "runtime/engine/context_cache/context_cost.h"
 #include "runtime/engine/context_cache/context_portfolio_value.h"
 #include "runtime/engine/context_cache/materialization_budget.h"
@@ -924,8 +925,8 @@ private:
                            ? item.estimated_total_ns - parent.estimated_total_ns
                            : 0;
             };
-            const __uint128_t left  = static_cast<__uint128_t>(delta(cost)) * b;
-            const __uint128_t right = static_cast<__uint128_t>(delta(prior)) * a;
+            const WideUInt left  = static_cast<WideUInt>(delta(cost)) * b;
+            const WideUInt right = static_cast<WideUInt>(delta(prior)) * a;
             if (left != right) { return left < right; }
         }
         return cost.key() < prior.key();

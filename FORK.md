@@ -121,6 +121,19 @@ the one that was supposed to prove something proved nothing. Read back the count
 reports. And when every arm scores full marks, say so plainly: a saturated test shows an effect is
 absent, never how large it is, and ranking arms needs a task the baseline does not already ace.
 
+**11. A kernel patch is judged against an artifact, not against the repository.** Upstream's
+widened w8 rowsplit decode was measured here in August and thrown away with a correct-sounding
+reason: the patched MMA kernel never ran, because `w8_dispatch` sends small token counts to
+`launch_w8_small_t` and the SIMT kernels. That was true, and it was a statement about the
+*artifact*, not the patch. On the Ostfralla NVFP4 checkpoint W8G32 covers only the MTP head, the
+vision merger's second projection and the embedding/output head, all of which decode at tiny `t`.
+The Ornith 35B-A3B checkpoint carries a hundred and ninety-five W8G32 tensors across its attention
+and GDN projections, and at prefill chunk 1024 every one of its three shapes resolves to
+`launch_w8_mma_r64_c128`. Measured there a month later, the same commit was worth +2.16% of
+prefill, with the output hash unchanged. Two checkpoints that the same binary serves can disagree
+about whether a kernel exists at all. When a patch is rejected because its route is not taken,
+write down which checkpoint was on the card.
+
 ## Layout
 
 `e8-overlay-adaptive` is the daily driver. `e8-win` and `e8-win-overlay` are deliberately older

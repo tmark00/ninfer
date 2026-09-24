@@ -1,9 +1,12 @@
 #include "core/device.h"
 
+#include "core/cuda_sync.h"
+
 #include <cstdio>
 #include <cstdlib>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 
 namespace ninfer {
 namespace {
@@ -17,6 +20,52 @@ void log_cuda_error(const char* op, cudaError_t err) noexcept {
         std::fprintf(stderr, "CUDA cleanup failed during %s: %s: %s\n", op, cudaGetErrorName(err),
                      cudaGetErrorString(err));
     }
+}
+
+struct SyncSchedule {
+    std::string_view name;
+    unsigned int flags;
+};
+
+// Spin first: it is the default, and it is the one measured fastest on this machine.
+constexpr SyncSchedule kSyncSchedules[] = {
+    {"spin", cudaDeviceScheduleSpin},
+    {"blocking", cudaDeviceScheduleBlockingSync},
+    {"yield", cudaDeviceScheduleYield},
+    {"auto", cudaDeviceScheduleAuto},
+};
+
+unsigned int requested_sync_schedule() {
+    const char* value = std::getenv("NINFER_CUDA_SYNC");
+    if (value == nullptr || *value == '\0') { return cudaDeviceScheduleSpin; }
+    for (const SyncSchedule& schedule : kSyncSchedules) {
+        if (schedule.name == value) { return schedule.flags; }
+    }
+    throw std::invalid_argument("NINFER_CUDA_SYNC must be spin, blocking, yield, or auto");
+}
+
+unsigned int active_sync_schedule() {
+    unsigned int flags    = 0;
+    const cudaError_t err = cudaGetDeviceFlags(&flags);
+    if (err != cudaSuccess) {
+        throw std::runtime_error(cuda_error_message("cudaGetDeviceFlags failed", err));
+    }
+    return flags & cudaDeviceScheduleMask;
+}
+
+// Without this the device runs cudaDeviceScheduleAuto, which spin-waits whenever the host has
+// more cores than contexts: one core sits at 100% for as long as the GPU is busy. Spin is still
+// the default because blocking measured 0.37% slower here, but a quiet or battery-powered run
+// wants the core back and can say so.
+void apply_sync_schedule() {
+    const unsigned int requested = requested_sync_schedule();
+    const cudaError_t err        = cudaSetDeviceFlags(requested);
+    if (err == cudaSuccess) { return; }
+    (void)cudaGetLastError(); // don't leak this into later launch checks
+    // A later context in the same process cannot set the schedule again. That only matters when
+    // the schedule it asks for differs from the one already in force.
+    if (err == cudaErrorSetOnActiveProcess && active_sync_schedule() == requested) { return; }
+    throw std::runtime_error(cuda_error_message("cudaSetDeviceFlags failed", err));
 }
 
 void destroy_stream(cudaStream_t& stream) noexcept {
@@ -34,6 +83,14 @@ void destroy_event(cudaEvent_t& event) noexcept {
 }
 
 } // namespace
+
+const char* cuda_sync_schedule_name() {
+    const unsigned int flags = active_sync_schedule();
+    for (const SyncSchedule& schedule : kSyncSchedules) {
+        if (flags == schedule.flags) { return schedule.name.data(); }
+    }
+    return "unknown";
+}
 
 void cuda_check(cudaError_t err, const char* expr, const char* file, int line) {
     if (err == cudaSuccess) { return; }
@@ -55,6 +112,8 @@ DeviceContext::DeviceContext(int device_id) : device(device_id) {
     if (err != cudaSuccess) {
         throw std::runtime_error(cuda_error_message("cudaSetDevice failed", err));
     }
+
+    apply_sync_schedule();
 
     err = cudaGetDeviceProperties(&props, device_id);
     if (err != cudaSuccess) {

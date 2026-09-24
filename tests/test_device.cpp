@@ -1,7 +1,10 @@
+#include "core/cuda_sync.h"
 #include "core/device.h"
 
 #include <cuda_runtime.h>
 
+#include <cstdlib>
+#include <cstring>
 #include <iostream>
 #include <stdexcept>
 #include <utility>
@@ -46,9 +49,20 @@ int check_context(const ninfer::DeviceContext& ctx, const char* label) {
     return failures;
 }
 
+void select_sync_schedule(const char* value) {
+#ifdef _WIN32
+    _putenv_s("NINFER_CUDA_SYNC", value);
+#else
+    setenv("NINFER_CUDA_SYNC", value, 1);
+#endif
+}
+
 } // namespace
 
 int main() {
+    // Must precede the first DeviceContext: the schedule is chosen when the device binds.
+    select_sync_schedule("blocking");
+
     int count                   = 0;
     const cudaError_t count_err = cudaGetDeviceCount(&count);
     if (cuda_unavailable(count_err)) {
@@ -72,6 +86,11 @@ int main() {
         std::cerr << "ctx.device expected 0, got " << ctx.device << '\n';
     }
     failures += check_context(ctx, "ctx");
+    if (std::strcmp(ninfer::cuda_sync_schedule_name(), "blocking") != 0) {
+        ++failures;
+        std::cerr << "NINFER_CUDA_SYNC=blocking was not applied, got "
+                  << ninfer::cuda_sync_schedule_name() << '\n';
+    }
     ctx.synchronize();
 
     const cudaStream_t original_stream = ctx.stream;

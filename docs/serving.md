@@ -44,6 +44,11 @@ a physical width from one through five using filtered accepted-prefix survival f
 rounds. Width selection is internal to the Engine and is not an HTTP request field. Adaptive
 startup reserves compact frame, ReplaySSM, and CUDA Graph profiles for all admitted widths.
 
+## CUDA synchronization
+
+`NINFER_CUDA_SYNC` selects the device synchronization schedule (`spin` by default, or `blocking`, `yield`, `auto`); the listening line reports the mode in force.
+See [CUDA synchronization](cli.md#cuda-synchronization).
+
 ## Endpoints
 
 | Method and path | Behavior |

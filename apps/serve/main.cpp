@@ -1,3 +1,4 @@
+#include "core/cuda_sync.h"
 #include "product/load_progress/load_progress.h"
 #include "serve/console_log.h"
 #include "serve/generation_service.h"
@@ -133,7 +134,8 @@ int main(int argc, char** argv) {
         listening << "listening on http://" << options.host << ':' << options.port;
         if (wildcard_bind) { listening << " (all interfaces)"; }
         listening << " (model id: " << server.public_model_id()
-                  << ", auth: " << (options.api_key.empty() ? "disabled" : "bearer") << ')';
+                  << ", auth: " << (options.api_key.empty() ? "disabled" : "bearer")
+                  << ", cuda-sync: " << ninfer::cuda_sync_schedule_name() << ')';
         ninfer::serve::write_console_log(ninfer::serve::ConsoleLogLevel::Info, listening.str());
 
         if (!options.webui_dir.empty()) {

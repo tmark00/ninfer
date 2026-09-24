@@ -208,6 +208,22 @@ generated token IDs in diagnostics.
 
 Run `./build/apps/ninfer --help` for the exact option contract.
 
+## CUDA synchronization
+
+`NINFER_CUDA_SYNC` picks the device synchronization schedule when the engine binds its GPU, for
+both the CLI and the server. It accepts `spin`, `blocking`, `yield` and `auto`, and defaults to
+`spin`. An unrecognized value fails startup, and the server reports the selected mode on its
+listening line.
+
+`spin` waits at 100% of one CPU core for as long as the GPU is busy. That is the fastest option
+measured here and the reason it is the default; `blocking` costs about 0.37% of decode rounds on
+an RTX 5090 Laptop and hands the core back, which is what a quiet or battery-powered session
+wants.
+
+```bash
+NINFER_CUDA_SYNC=blocking ./build-win/apps/ninfer model.ninfer --prompt "Czesc"
+```
+
 ## Context and memory
 
 The registered model IDs have a native context limit of 262,144 tokens. The practical

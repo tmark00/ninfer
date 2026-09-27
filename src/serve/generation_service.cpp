@@ -203,8 +203,10 @@ public:
         }
     }
 
-    std::size_t finish(bool is_tool_call_response) {
-        if (filter_tool_calls_) { publish_content(tool_filter_.finish(is_tool_call_response)); }
+    std::size_t finish(bool is_tool_call_response, std::string_view recovered_content) {
+        if (filter_tool_calls_) {
+            publish_content(tool_filter_.finish(is_tool_call_response, recovered_content));
+        }
         return content_bytes_;
     }
 
@@ -424,7 +426,7 @@ GenerationOutcome GenerationService::run(PreparedRequest& prepared, const Stream
         if (is_tool_call_response) { outcome.tool_calls = std::move(parsed.tool_calls); }
     }
     if (output_sink) {
-        outcome.streamed_content_bytes = output_sink->finish(is_tool_call_response);
+        outcome.streamed_content_bytes = output_sink->finish(is_tool_call_response, outcome.text);
     }
     return outcome;
 }

@@ -5,6 +5,7 @@
 
 #include <iostream>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace {
@@ -637,6 +638,132 @@ int test_duplicate_tool_definition_replaced() {
     return failures;
 }
 
+
+// A model that reasons about tool markup quotes the opener before making the real call. The wire
+// format has no escape, so parsing must retry from a later opener instead of returning the call
+// as text.
+int test_quoted_marker_before_real_call() {
+    ninfer::serve::ToolParamTypeMap map;
+    const ninfer::serve::ParsedToolCallOutput parsed =
+        ninfer::serve::parse_qwen_tool_call_output("I will emit <tool_call> with the city.\n"
+                                                   "<tool_call>\n"
+                                                   "<function=get_weather>\n"
+                                                   "<parameter=city>\nParis\n</parameter>\n"
+                                                   "</function>\n"
+                                                   "</tool_call>",
+                                                   64, map);
+    int failures = 0;
+    failures += check(parsed.is_tool_call_response, "call after a quoted opener is recovered");
+    failures += check(parsed.tool_calls.size() == 1, "one recovered call");
+    failures += check(parsed.tool_calls.size() == 1 && parsed.tool_calls[0].name == "get_weather",
+                      "recovered call keeps its name");
+    failures += check(parsed.content == "I will emit <tool_call> with the city.",
+                      "text before the recovered call becomes content");
+    return failures;
+}
+
+int test_two_calls_after_quoted_marker() {
+    ninfer::serve::ToolParamTypeMap map;
+    const ninfer::serve::ParsedToolCallOutput parsed =
+        ninfer::serve::parse_qwen_tool_call_output("First <tool_call> then both:\n"
+                                                   "<tool_call>\n<function=a>\n</function>\n</tool_call>\n"
+                                                   "<tool_call>\n<function=b>\n</function>\n</tool_call>",
+                                                   64, map);
+    int failures = 0;
+    failures += check(parsed.is_tool_call_response, "multi-call suffix recovered");
+    failures += check(parsed.tool_calls.size() == 2, "both calls kept");
+    failures += check(parsed.tool_calls.size() == 2 && parsed.tool_calls[0].name == "a" &&
+                          parsed.tool_calls[1].name == "b",
+                      "recovered calls keep their order");
+    return failures;
+}
+
+int test_all_candidates_fail_falls_back() {
+    ninfer::serve::ToolParamTypeMap map;
+    const std::string text = "Talking about <tool_call> and <tool_call> without ever making one.";
+    const ninfer::serve::ParsedToolCallOutput parsed =
+        ninfer::serve::parse_qwen_tool_call_output(text, 64, map);
+    int failures = 0;
+    failures += check(!parsed.is_tool_call_response, "no candidate parses, so not a tool response");
+    failures += check(parsed.tool_calls.empty(), "no calls reported");
+    failures += check(parsed.content == text, "whole output preserved as content");
+    return failures;
+}
+
+// A complete call followed by text must still fall back: executing a later call on its own would
+// drop the text the model put between them.
+int test_complete_call_then_text_then_call_falls_back() {
+    ninfer::serve::ToolParamTypeMap map;
+    const std::string text = "<tool_call>\n<function=a>\n</function>\n</tool_call>\n"
+                             "some trailing words\n"
+                             "<tool_call>\n<function=b>\n</function>\n</tool_call>";
+    const ninfer::serve::ParsedToolCallOutput parsed =
+        ninfer::serve::parse_qwen_tool_call_output(text, 64, map);
+    int failures = 0;
+    failures += check(!parsed.is_tool_call_response, "trailing content between calls falls back");
+    failures += check(parsed.content == text, "output preserved verbatim");
+    return failures;
+}
+
+int test_value_quoting_parameter_closer() {
+    ninfer::serve::ToolParamTypeMap map;
+    const ninfer::serve::ParsedToolCallOutput parsed =
+        ninfer::serve::parse_qwen_tool_call_output("<tool_call>\n<function=write_doc>\n"
+                                                   "<parameter=body>\n"
+                                                   "Close a value with </parameter> when done.\n"
+                                                   "</parameter>\n"
+                                                   "</function>\n</tool_call>",
+                                                   64, map);
+    int failures = 0;
+    failures += check(parsed.is_tool_call_response, "value quoting a closer still parses");
+    if (parsed.tool_calls.size() == 1) {
+        const Json args = Json::parse(parsed.tool_calls[0].arguments_json);
+        failures += check(args.at("body") == "Close a value with </parameter> when done.",
+                          "quoted closer stays inside the value");
+    } else {
+        failures += fail("expected one call for a value quoting a closer");
+    }
+    return failures;
+}
+
+int test_truncated_value_falls_back() {
+    ninfer::serve::ToolParamTypeMap map;
+    const std::string text = "<tool_call>\n<function=write_doc>\n"
+                             "<parameter=body>\nnever closed\n</function>\n</tool_call>";
+    const ninfer::serve::ParsedToolCallOutput parsed =
+        ninfer::serve::parse_qwen_tool_call_output(text, 64, map);
+    int failures = 0;
+    failures += check(!parsed.is_tool_call_response, "unterminated value falls back");
+    failures += check(parsed.content == text, "truncated output preserved");
+    return failures;
+}
+
+// The stream filter buffers everything after the first opener, so a recovered call must publish
+// the content the parser reports rather than discarding the whole region.
+int test_incremental_filter_recovered_content() {
+    const std::string text = "I will emit <tool_call> now.\n"
+                             "<tool_call>\n<function=a>\n</function>\n</tool_call>";
+    ninfer::serve::ToolParamTypeMap map;
+    const ninfer::serve::ParsedToolCallOutput parsed =
+        ninfer::serve::parse_qwen_tool_call_output(text, 64, map);
+
+    int failures = 0;
+    failures += check(parsed.is_tool_call_response, "recovered call for the streaming case");
+
+    for (const std::size_t chunk : {std::size_t{1}, std::size_t{3}, std::size_t{7}}) {
+        ninfer::serve::ToolCallStreamFilter filter;
+        std::string published;
+        for (std::size_t at = 0; at < text.size(); at += chunk) {
+            published += filter.feed(std::string_view(text).substr(at, chunk));
+        }
+        published += filter.finish(parsed.is_tool_call_response, parsed.content);
+        failures += check(published == parsed.content,
+                          "streamed content matches the recovered content at chunk " +
+                              std::to_string(chunk));
+    }
+    return failures;
+}
+
 } // namespace
 
 int main() {
@@ -665,6 +792,13 @@ int main() {
     failures += test_schema_non_string_non_array_type_preserves_raw();
     failures += test_duplicate_tool_definition_no_properties_replaces();
     failures += test_duplicate_tool_definition_replaced();
+    failures += test_quoted_marker_before_real_call();
+    failures += test_two_calls_after_quoted_marker();
+    failures += test_all_candidates_fail_falls_back();
+    failures += test_complete_call_then_text_then_call_falls_back();
+    failures += test_value_quoting_parameter_closer();
+    failures += test_truncated_value_falls_back();
+    failures += test_incremental_filter_recovered_content();
     if (failures == 0) { std::cout << "ok\n"; }
     return failures == 0 ? 0 : 1;
 }

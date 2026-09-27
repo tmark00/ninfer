@@ -190,9 +190,20 @@ bool parse_parameter(std::string_view inner, std::size_t& pos, Json& args,
     const std::size_t name_end   = inner.find('>', name_begin);
     if (name_end == std::string_view::npos || name_end == name_begin) { return false; }
     const std::string key       = std::string(inner.substr(name_begin, name_end - name_begin));
-    pos                         = name_end + 1;
-    const std::size_t value_end = inner.find(kParamClose, pos);
-    if (value_end == std::string_view::npos) { return false; }
+    pos = name_end + 1;
+    // The wire format has no escape, so a value that quotes </parameter> - an agent prompt
+    // discussing tool markup does - would end the value early and fail the whole call. A closer
+    // ends the value only when the next thing at this depth is another parameter or the end of
+    // the block; otherwise it is value text and the search continues past it.
+    std::size_t value_end = pos;
+    for (;;) {
+        value_end = inner.find(kParamClose, value_end);
+        if (value_end == std::string_view::npos) { return false; }
+        std::size_t after = value_end + kParamClose.size();
+        skip_ws(inner, after);
+        if (after >= inner.size() || starts_with_at(inner, after, kParamOpen)) { break; }
+        value_end += kParamClose.size();
+    }
     const std::string raw_value = trim_ascii(inner.substr(pos, value_end - pos));
     const std::vector<std::string>* declared = param_declared_types(param_types, tool_name, key);
     const bool is_boolean =
@@ -276,41 +287,88 @@ ParsedToolCallOutput fallback(const std::string& text) {
     return out;
 }
 
+
+// How a region beginning at one opener reads.
+enum class RegionParse {
+    Calls,           // the whole region is complete calls and nothing else
+    TrailingContent, // at least one complete call, then text
+    NoCall,          // the opener does not begin a complete call
+};
+
+RegionParse parse_calls_from(const std::string& text, std::size_t start,
+                            std::size_t max_tool_name_length,
+                            const ToolParamTypeMap& param_types, std::vector<ToolCall>& calls) {
+    constexpr std::string_view kToolOpen  = "<tool_call>";
+    constexpr std::string_view kToolClose = "</tool_call>";
+    calls.clear();
+    std::size_t pos = start;
+    while (pos < text.size()) {
+        skip_ws(text, pos);
+        if (pos >= text.size()) { break; }
+        const bool opener = starts_with_at(text, pos, kToolOpen);
+        const std::size_t inner_begin = pos + kToolOpen.size();
+        const std::size_t close = opener ? text.find(kToolClose, inner_begin) : std::string::npos;
+        ToolCall call;
+        const bool parsed =
+            opener && close != std::string::npos &&
+            parse_one_tool_call(std::string_view(text).substr(inner_begin, close - inner_begin),
+                                max_tool_name_length, param_types, call);
+        if (!parsed) {
+            return calls.empty() ? RegionParse::NoCall : RegionParse::TrailingContent;
+        }
+        calls.push_back(std::move(call));
+        pos = close + kToolClose.size();
+    }
+    return calls.empty() ? RegionParse::NoCall : RegionParse::Calls;
+}
+
 } // namespace
 
 ParsedToolCallOutput parse_qwen_tool_call_output(const std::string& text,
                                                  std::size_t max_tool_name_length,
                                                  const ToolParamTypeMap& param_types) {
-    constexpr std::string_view kToolOpen  = "<tool_call>";
-    constexpr std::string_view kToolClose = "</tool_call>";
+    constexpr std::string_view kToolOpen = "<tool_call>";
 
     const std::size_t first = text.find(kToolOpen);
     if (first == std::string::npos) { return fallback(text); }
 
-    ParsedToolCallOutput out;
-    out.content = rtrim_ascii(std::string_view(text).substr(0, first));
+    const auto accept = [&text](std::size_t start, std::vector<ToolCall>& calls) {
+        ParsedToolCallOutput out;
+        out.content               = rtrim_ascii(std::string_view(text).substr(0, start));
+        out.tool_calls            = std::move(calls);
+        out.is_tool_call_response = true;
+        return out;
+    };
 
-    std::size_t pos = first;
-    while (pos < text.size()) {
-        skip_ws(text, pos);
-        if (pos >= text.size()) { break; }
-        if (!starts_with_at(text, pos, kToolOpen)) { return fallback(text); }
-        const std::size_t inner_begin = pos + kToolOpen.size();
-        const std::size_t close       = text.find(kToolClose, inner_begin);
-        if (close == std::string::npos) { return fallback(text); }
-        ToolCall call;
-        if (!parse_one_tool_call(std::string_view(text).substr(inner_begin, close - inner_begin),
-                                 max_tool_name_length, param_types, call)) {
-            return fallback(text);
-        }
-        out.tool_calls.push_back(std::move(call));
-        pos = close + kToolClose.size();
+    std::vector<ToolCall> calls;
+    const RegionParse from_first =
+        parse_calls_from(text, first, max_tool_name_length, param_types, calls);
+    if (from_first == RegionParse::Calls) { return accept(first, calls); }
+    // A complete call followed by text is the model saying more than the call. Recovering a later
+    // one would execute it alone and drop that text, so this falls back whole.
+    if (from_first == RegionParse::TrailingContent) { return fallback(text); }
+
+    // The opener did not begin a call at all: the model quoted it in prose while reasoning about
+    // the call it makes next, and the format has no escape. Retry from the last few later openers,
+    // earliest first, so a multi-call suffix keeps every call it contains.
+    constexpr std::size_t kMaximumRecoveryOpeners = 4;
+    std::vector<std::size_t> later;
+    for (std::size_t at = text.find(kToolOpen, first + kToolOpen.size()); at != std::string::npos;
+         at             = text.find(kToolOpen, at + kToolOpen.size())) {
+        later.push_back(at);
     }
-
-    if (out.tool_calls.empty()) { return fallback(text); }
-    out.is_tool_call_response = true;
-    return out;
+    if (later.size() > kMaximumRecoveryOpeners) {
+        later.erase(later.begin(), later.end() - kMaximumRecoveryOpeners);
+    }
+    for (const std::size_t start : later) {
+        if (parse_calls_from(text, start, max_tool_name_length, param_types, calls) ==
+            RegionParse::Calls) {
+            return accept(start, calls);
+        }
+    }
+    return fallback(text);
 }
+
 
 std::string ToolCallStreamFilter::feed(std::string_view text) {
     if (finished_) { throw std::logic_error("tool-call stream filter is already finished"); }
@@ -348,12 +406,21 @@ std::string ToolCallStreamFilter::feed(std::string_view text) {
     return visible;
 }
 
-std::string ToolCallStreamFilter::finish(bool is_tool_call_response) {
+std::string ToolCallStreamFilter::finish(bool is_tool_call_response,
+                                        std::string_view recovered_content) {
     if (finished_) { throw std::logic_error("tool-call stream filter is already finished"); }
     finished_ = true;
     if (is_tool_call_response) {
         pending_.clear();
         tool_region_.clear();
+        // A call recovered past a quoted opener leaves content this filter buffered as tool
+        // region, because the quote looked like the start of the call. Publish the part of that
+        // content not emitted yet; recovered_content is a prefix of the same output.
+        if (recovered_content.size() > emitted_bytes_) {
+            std::string tail(recovered_content.substr(emitted_bytes_));
+            emitted_bytes_ += tail.size();
+            return tail;
+        }
         return {};
     }
     std::string tail = std::move(pending_);

@@ -51,7 +51,9 @@ ParsedToolCallOutput parse_qwen_tool_call_output(const std::string& text,
 class ToolCallStreamFilter {
 public:
     std::string feed(std::string_view text);
-    std::string finish(bool is_tool_call_response);
+    // recovered_content is the parsed content of a tool response: empty in the ordinary case,
+    // and the prose before a call recovered past a quoted opener otherwise.
+    std::string finish(bool is_tool_call_response, std::string_view recovered_content = {});
 
     [[nodiscard]] std::size_t emitted_bytes() const noexcept { return emitted_bytes_; }
 

@@ -875,6 +875,9 @@ void TextContext::gdn_mix(const GdnLayerW& w, Tensor& x, int gidx, Phase ph) {
         if (width <= 0 || width * active_sequence_batch_ != T) {
             throw std::logic_error("GDN sequence batch binding does not match aggregate columns");
         }
+        if (gdn_state_action_ == GdnStateAction::UpdateInPlace && width != 1) {
+            throw std::logic_error("In-place batched GDN update requires width one");
+        }
         Tensor projection_input = h.view({kCfg.hidden, width, active_sequence_batch_});
         Tensor query_output     = qc.view({kCfg.key_dim, width, active_sequence_batch_});
         Tensor key_output       = kc.view({kCfg.key_dim, width, active_sequence_batch_});
@@ -936,16 +939,16 @@ void TextContext::gdn_mix(const GdnLayerW& w, Tensor& x, int gidx, Phase ph) {
                                                *active_linear_state_slots_, records.key,
                                                records.value, records.gate, out_batch, s);
         } else {
-            ops::gated_delta_net_snapshot(q_batch, k_batch, v_batch, g_batch, beta_batch, kGdnScale,
-                                          /*normalize_qk=*/true, recurrent_states, valid,
-                                          *active_linear_state_slots_, *active_linear_state_slots_,
-                                          out_batch, s);
+            ops::gated_delta_net_batch_update(
+                q_batch, k_batch, v_batch, g_batch, beta_batch, kGdnScale,
+                /*normalize_qk=*/true, recurrent_states, *active_linear_state_slots_, out_batch, s);
         }
     } else {
         Tensor recurrent_state =
             state_.recurrent_slot(static_cast<std::uint32_t>(gidx), linear_state_current_slot_);
         ops::gated_delta_net(q_recurrent, k_recurrent, vv, g, beta, kGdnScale,
-                             /*normalize_qk=*/true, work_, recurrent_state, o, s);
+                             /*normalize_qk=*/true, work_, recurrent_state, o,
+                             ctx_.execution_view());
     }
 
     Tensor on = workspace_recipe::gdn_normalized_output<TextConfig>(work_, T).view(

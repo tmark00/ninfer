@@ -179,6 +179,10 @@ std::size_t DeviceContext::total_vram() const noexcept { return props.totalGloba
 
 void DeviceContext::synchronize() const { CUDA_CHECK(cudaStreamSynchronize(stream)); }
 
+DeviceExecutionView DeviceContext::execution_view() const noexcept {
+    return {stream, static_cast<std::int32_t>(props.multiProcessorCount)};
+}
+
 CudaEventTimer::CudaEventTimer(const DeviceContext& ctx) : stream_(ctx.stream) {
     cudaError_t err = cudaSetDevice(ctx.device);
     if (err != cudaSuccess) {

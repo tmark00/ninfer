@@ -1,18 +1,11 @@
-// Production and stage-attribution benchmark for the Gated DeltaNet Op.
-//
-// Complete running-state, snapshot, and pre-normalized chunked-pipeline measurements call the
-// public Op. There is one intentional exception to the public-benchmark rule: --breakdown calls
-// exactly the chunked algorithm's prepare_wy_wu, state_passing, and output stage launchers so that
-// optimization can attribute pipeline latency. Those stages are intrinsic parts of one production
-// algorithm, not alternative public routes or candidate dispatch controls. No other private
-// launcher belongs in this long-lived benchmark.
-//
-// Every measurement is a cold-L2 CUDA Graph replay. The 256 MiB flush happens before, and outside,
-// each timed replay.
+// Public GDN and production-stage timing. Private launchers also measure the prefill
+// recurrent/chunked crossover, independently of decode/ReplaySSM.
+// Each sample is a cold-L2 CUDA Graph replay with the flush outside its timer.
 #include "ninfer/ops/gated_delta_net.h"
 #include "ninfer/ops/l2norm.h"
 #include "ninfer_bench_common.h"
 #include "ops/linear_attention/gated_delta_net/chunked/launch.h"
+#include "ops/linear_attention/gated_delta_net/launch.h"
 
 #include <cuda_runtime.h>
 
@@ -36,18 +29,18 @@ namespace {
 namespace gated_delta_net_detail = ninfer::ops::detail::gated_delta_net;
 namespace chunked_detail         = ninfer::ops::detail::gated_delta_net::chunked;
 
-constexpr std::int32_t kDefaultQkHeads      = 16;
-constexpr std::int32_t kDefaultValueHeads   = 48;
-constexpr std::int32_t kDefaultTokens       = 1024;
-constexpr std::int32_t kSnapshotSlots       = 17;
-constexpr std::int32_t kSnapshotInitialSlot = 16;
-constexpr std::size_t kDefaultFlushBytes    = 256ULL << 20;
-constexpr float kQkNormEpsilon              = 1.0e-6F;
+constexpr std::int32_t kDefaultQkHeads    = 16;
+constexpr std::int32_t kDefaultValueHeads = 48;
+constexpr std::int32_t kDefaultTokens     = 1024;
+constexpr std::size_t kDefaultFlushBytes  = 256ULL << 20;
+constexpr float kQkNormEpsilon            = 1.0e-6F;
 
 enum class Mode {
     Running,
-    Snapshot,
+    BatchUpdate,
     ChunkedOnly,
+    ForceChunked,
+    RecurrentOnly,
 };
 
 struct Options {
@@ -62,11 +55,10 @@ struct Options {
     std::int32_t value_heads = kDefaultValueHeads;
     std::int32_t tokens      = kDefaultTokens;
     std::int32_t batch       = 1;
-    std::vector<std::int32_t> valid_columns;
-    int warmup              = 20;
-    int repeat              = 100;
-    std::size_t flush_bytes = kDefaultFlushBytes;
-    std::string qk_norm     = "fused";
+    int warmup               = 20;
+    int repeat               = 100;
+    std::size_t flush_bytes  = kDefaultFlushBytes;
+    std::string qk_norm      = "fused";
 };
 
 struct Problem {
@@ -116,25 +108,6 @@ std::int32_t parse_integer(const char* flag, const char* text, std::int32_t mini
     return static_cast<std::int32_t>(value);
 }
 
-std::vector<std::int32_t> parse_valid_columns(const char* text) {
-    std::vector<std::int32_t> values;
-    const char* cursor = text;
-    while (*cursor != '\0') {
-        errno            = 0;
-        char* end        = nullptr;
-        const long value = std::strtol(cursor, &end, 10);
-        if (errno != 0 || end == cursor || value <= 0 || value > INT32_MAX) {
-            fail("invalid --valid-columns");
-        }
-        values.push_back(static_cast<std::int32_t>(value));
-        if (*end == '\0') break;
-        if (*end != ',') { fail("invalid --valid-columns"); }
-        cursor = end + 1;
-    }
-    if (values.empty()) { fail("--valid-columns must not be empty"); }
-    return values;
-}
-
 void set_mode(Options& options, Mode mode, const char* flag) {
     if (options.mode_explicit && options.mode != mode) {
         fail(std::string(flag) + " cannot be combined with another benchmark mode");
@@ -154,10 +127,14 @@ Options parse_options(int argc, char** argv) {
 
         if (arg == "--running") {
             set_mode(options, Mode::Running, "--running");
-        } else if (arg == "--snapshot") {
-            set_mode(options, Mode::Snapshot, "--snapshot");
+        } else if (arg == "--batch-update") {
+            set_mode(options, Mode::BatchUpdate, "--batch-update");
         } else if (arg == "--chunked-only") {
             set_mode(options, Mode::ChunkedOnly, "--chunked-only");
+        } else if (arg == "--force-chunked") {
+            set_mode(options, Mode::ForceChunked, "--force-chunked");
+        } else if (arg == "--recurrent-only") {
+            set_mode(options, Mode::RecurrentOnly, "--recurrent-only");
         } else if (arg == "--tokens") {
             options.tokens          = parse_integer("--tokens", take("--tokens"), 1);
             options.tokens_explicit = true;
@@ -169,8 +146,6 @@ Options parse_options(int argc, char** argv) {
             options.value_heads = parse_integer("--value-heads", take("--value-heads"), 1);
         } else if (arg == "--batch") {
             options.batch = parse_integer("--batch", take("--batch"), 1);
-        } else if (arg == "--valid-columns") {
-            options.valid_columns = parse_valid_columns(take("--valid-columns"));
         } else if (arg == "--qk-norm") {
             options.qk_norm = take("--qk-norm");
             if (options.qk_norm != "fused" && options.qk_norm != "composed") {
@@ -200,79 +175,60 @@ Options parse_options(int argc, char** argv) {
     if (!gated_delta_net_detail::are_head_counts_valid(options.qk_heads, options.value_heads)) {
         fail("value heads must be at least q/k heads and divisible by them");
     }
-    if (options.breakdown && options.mode != Mode::ChunkedOnly) {
-        fail("--breakdown requires --chunked-only");
+    if (options.breakdown && options.mode == Mode::BatchUpdate) {
+        fail("--breakdown requires a prefill mode");
     }
-    if (options.qk_norm == "composed" && options.mode != Mode::Snapshot) {
-        fail("--qk-norm composed is a snapshot comparison");
+    if (options.qk_norm == "composed" && options.mode != Mode::BatchUpdate) {
+        fail("--qk-norm composed is a batch-update comparison");
     }
-    if (options.batch > 8 ||
-        (options.mode != Mode::Snapshot &&
-         (options.batch != 1 || !options.valid_columns.empty())) ||
-        (!options.valid_columns.empty() &&
-         (options.valid_columns.size() != static_cast<std::size_t>(options.batch) ||
-          !options.tokens_explicit)) ||
+    if (options.batch > 8 || (options.mode != Mode::BatchUpdate && options.batch != 1) ||
         (options.batch > 1 && options.qk_norm == "composed")) {
-        fail("batch metadata is valid only for an exact fused-normalization snapshot workload");
+        fail("batch metadata is valid only for a fused-normalization batch update");
     }
     return options;
 }
 
 void print_help(const char* program) {
-    std::printf("Usage: %s [mode] [options]\n"
-                "\n"
-                "Modes (default: --running):\n"
-                "  --running          public running-state Gated DeltaNet\n"
-                "  --snapshot         public snapshot Gated DeltaNet; defaults to T=1..16\n"
-                "  --chunked-only     public pre-normalized BF16 chunked pipeline\n"
-                "  --breakdown        with --chunked-only, also time prepare/state/output stages\n"
-                "\n"
-                "Workload:\n"
-                "  --tokens N         exact token extent (running/chunked default: 1024)\n"
-                "  --sweep            running: 1,63,64,65,128,1024; snapshot: 1..16;\n"
-                "                     chunked: 64,128,256,512,1024,4096\n"
-                "  --qk-heads N       Q/K heads (default: 16)\n"
-                "  --value-heads N    divisible value heads >= Q/K heads (default: 48)\n"
-                "  --batch B          exact snapshot batch in [1,8] (default: 1)\n"
-                "  --valid-columns V  optional snapshot prefix lengths, comma-separated\n"
-                "  --qk-norm MODE     snapshot normalization: fused or composed (default: fused)\n"
-                "\n"
-                "Measurement:\n"
-                "  --warmup N         cold-L2 graph warmups per case (default: 20)\n"
-                "  --repeat N         measured cold-L2 graph replays per case (default: 100)\n"
-                "  --flush-mib N      L2 flush allocation in MiB (default: 256)\n"
-                "  --csv              emit CSV instead of human-readable rows\n"
-                "  -h, --help         show this help\n"
-                "\n"
-                "State/head dimension 128 is fixed; running/chunked use batch 1.\n",
-                program);
+    std::printf(
+        "Usage: %s [mode] [options]\n"
+        "\n"
+        "Modes (default: --running):\n"
+        "  --running          public running-state Gated DeltaNet\n"
+        "  --batch-update     public selected-slot Gated DeltaNet update at T=1\n"
+        "  --chunked-only     forced chunked with pre-normalized BF16 inputs\n"
+        "  --force-chunked    forced chunked with fused Q/K normalization\n"
+        "  --recurrent-only   prefill recurrence with fused Q/K normalization\n"
+        "  --breakdown        also time prepare and recurrence/output separately\n"
+        "\n"
+        "Workload:\n"
+        "  --tokens N         exact token extent (running/chunked default: 1024)\n"
+        "  --sweep            short prefill boundaries through T=4096\n"
+        "  --qk-heads N       Q/K heads (default: 16)\n"
+        "  --value-heads N    divisible value heads >= Q/K heads (default: 48)\n"
+        "  --batch B          exact batch-update batch in [1,8] (default: 1)\n"
+        "  --qk-norm MODE     batch-update normalization: fused or composed (default: fused)\n"
+        "\n"
+        "Measurement:\n"
+        "  --warmup N         cold-L2 graph warmups per case (default: 20)\n"
+        "  --repeat N         measured cold-L2 graph replays per case (default: 100)\n"
+        "  --flush-mib N      L2 flush allocation in MiB (default: 256)\n"
+        "  --csv              emit CSV instead of human-readable rows\n"
+        "  -h, --help         show this help\n"
+        "\n"
+        "State/head dimension 128 is fixed; running/chunked use batch 1.\n",
+        program);
 }
 
 std::vector<std::int32_t> token_values(const Options& options) {
     if (options.tokens_explicit) { return {options.tokens}; }
-    if (options.mode == Mode::Snapshot) {
-        std::vector<std::int32_t> tokens;
-        tokens.reserve(16);
-        for (std::int32_t token = 1; token <= 16; ++token) { tokens.push_back(token); }
-        return tokens;
-    }
+    if (options.mode == Mode::BatchUpdate) { return {1}; }
     if (!options.sweep) { return {kDefaultTokens}; }
-    if (options.mode == Mode::ChunkedOnly) { return {64, 128, 256, 512, 1024, 4096}; }
-    return {1, 63, 64, 65, 128, 1024};
+    return {1, 8, 12, 15, 16, 17, 24, 31, 32, 33, 63, 64, 65, 128, 1024, 4096};
 }
 
 void validate_tokens(const Options& options, std::int32_t tokens) {
-    if (options.mode == Mode::Snapshot && tokens > 16) {
-        fail("snapshot benchmark supports the production T range [1,16]");
-    }
-    if (options.mode == Mode::ChunkedOnly && (tokens % gated_delta_net_detail::kChunkSize) != 0) {
-        fail("--chunked-only requires tokens to be a multiple of kChunkSize (64)");
-    }
-    if (options.mode == Mode::Snapshot && options.batch > 1 && tokens > 16) {
-        fail("batched snapshot supports W in [1,16]");
-    }
-    for (const std::int32_t valid : options.valid_columns) {
-        if (valid > tokens) { fail("--valid-columns exceeds snapshot width"); }
+    if (options.mode == Mode::BatchUpdate && tokens != 1) {
+        fail("batch-update benchmark requires T=1");
     }
 }
 
@@ -430,7 +386,7 @@ double running_logical_bytes(const Problem& problem) {
     return 2.0 * qk_bytes + 2.0 * value_bytes + 2.0 * gate_bytes + 2.0 * state_bytes;
 }
 
-double snapshot_logical_bytes(const Problem& problem) {
+double batch_update_logical_bytes(const Problem& problem) {
     const double tokens   = static_cast<double>(problem.tokens);
     const double batch    = static_cast<double>(problem.batch);
     const double qk_bytes = static_cast<double>(gated_delta_net_detail::kStateDim) *
@@ -442,8 +398,8 @@ double snapshot_logical_bytes(const Problem& problem) {
     const double state_bytes = static_cast<double>(gated_delta_net_detail::kStateDim) *
                                gated_delta_net_detail::kStateDim * problem.value_heads * batch *
                                sizeof(float);
-    return 2.0 * qk_bytes + 2.0 * value_bytes + 2.0 * gate_bytes + (1.0 + tokens) * state_bytes +
-           2.0 * batch * sizeof(std::int32_t);
+    return 2.0 * qk_bytes + 2.0 * value_bytes + 2.0 * gate_bytes + 2.0 * state_bytes +
+           batch * sizeof(std::int32_t);
 }
 
 double qk_tensor_bytes(const Problem& problem) {
@@ -466,79 +422,21 @@ double state_tensor_bytes(const Problem& problem) {
            gated_delta_net_detail::kStateDim * problem.value_heads * problem.batch * sizeof(float);
 }
 
-double chunk_state_tensor_bytes(const Problem& problem) {
-    const double chunks = static_cast<double>(problem.tokens / gated_delta_net_detail::kChunkSize);
-    return state_tensor_bytes(problem) * chunks * 0.5;
+TrafficBytes prepare_traffic(const Problem& p, std::size_t workspace) {
+    return {2.0 * qk_tensor_bytes(p) * (p.value_heads / p.qk_heads) + 2.0 * gate_tensor_bytes(p) +
+                workspace,
+            double(workspace)};
 }
 
-TrafficBytes chunked_prepare_traffic(const Problem& problem) {
-    const double qk    = qk_tensor_bytes(problem);
-    const double value = value_tensor_bytes(problem);
-    const double gate  = gate_tensor_bytes(problem);
-    return {
-        qk + 3.0 * value + 3.0 * gate,
-        2.0 * value + gate,
-    };
+TrafficBytes recurrence_traffic(const Problem& p, int slices) {
+    const double packets =
+        double(chunked_detail::chunk_count(p.tokens)) * p.value_heads *
+        (sizeof(chunked_detail::QkChunk) + sizeof(chunked_detail::ControlChunk)) * slices;
+    return {packets + 2.0 * value_tensor_bytes(p) + 2.0 * state_tensor_bytes(p), packets};
 }
 
-TrafficBytes chunked_state_traffic(const Problem& problem) {
-    const double qk          = qk_tensor_bytes(problem);
-    const double value       = value_tensor_bytes(problem);
-    const double gate        = gate_tensor_bytes(problem);
-    const double state       = state_tensor_bytes(problem);
-    const double chunk_state = chunk_state_tensor_bytes(problem);
-    return {
-        qk + 3.0 * value + gate + 2.0 * state + chunk_state,
-        3.0 * value + gate + chunk_state,
-    };
-}
-
-TrafficBytes chunked_output_traffic(const Problem& problem) {
-    const double qk          = qk_tensor_bytes(problem);
-    const double value       = value_tensor_bytes(problem);
-    const double gate        = gate_tensor_bytes(problem);
-    const double chunk_state = chunk_state_tensor_bytes(problem);
-    return {
-        2.0 * qk + 2.0 * value + gate + chunk_state,
-        value + gate + chunk_state,
-    };
-}
-
-TrafficBytes chunked_pipeline_traffic(const Problem& problem) {
-    const TrafficBytes prepare = chunked_prepare_traffic(problem);
-    const TrafficBytes state   = chunked_state_traffic(problem);
-    const TrafficBytes output  = chunked_output_traffic(problem);
-    return {
-        prepare.total + state.total + output.total,
-        prepare.intermediate + state.intermediate + output.intermediate,
-    };
-}
-
-TrafficBytes running_traffic(const Problem& problem) {
-    const std::int32_t full_tokens =
-        (problem.tokens / gated_delta_net_detail::kChunkSize) * gated_delta_net_detail::kChunkSize;
-    if (full_tokens == 0) { return {running_logical_bytes(problem), 0.0}; }
-
-    const Problem full{problem.qk_heads, problem.value_heads, full_tokens};
-    const std::int32_t tail_tokens = problem.tokens - full_tokens;
-    const double qk_all            = qk_tensor_bytes(problem);
-    const double normalization     = 4.0 * qk_all;
-    const TrafficBytes chunked     = chunked_pipeline_traffic(full);
-
-    TrafficBytes traffic{
-        normalization + chunked.total,
-        2.0 * qk_all + 4.0 * qk_tensor_bytes(full) + chunked.intermediate,
-    };
-    if (tail_tokens > 0) {
-        const Problem tail{problem.qk_heads, problem.value_heads, tail_tokens};
-        traffic.total += running_logical_bytes(tail);
-        traffic.intermediate += 2.0 * qk_tensor_bytes(tail);
-    }
-    return traffic;
-}
-
-TrafficBytes snapshot_traffic(const Problem& problem, bool composed) {
-    const double logical = snapshot_logical_bytes(problem);
+TrafficBytes batch_update_traffic(const Problem& problem, bool composed) {
+    const double logical = batch_update_logical_bytes(problem);
     if (!composed) { return {logical, 0.0}; }
     const double normalized_qk_round_trip = 4.0 * qk_tensor_bytes(problem);
     return {
@@ -547,68 +445,8 @@ TrafficBytes snapshot_traffic(const Problem& problem, bool composed) {
     };
 }
 
-std::string running_implementation(std::int32_t tokens) {
-    const std::int32_t full_tokens =
-        (tokens / gated_delta_net_detail::kChunkSize) * gated_delta_net_detail::kChunkSize;
-    if (full_tokens == 0) { return "public.recurrent.qk_fused"; }
-    if (full_tokens == tokens) { return "public.l2norm_x2+chunked"; }
-    return "public.l2norm_x2+chunked+recurrent_tail";
-}
-
-BenchRow run_running(const Options& options, std::int32_t tokens, DeviceBuffer& flush,
-                     cudaStream_t stream) {
-    const Problem problem{options.qk_heads, options.value_heads, tokens};
-    Operands operands(problem, false);
-
-    const std::size_t state_elements = static_cast<std::size_t>(gated_delta_net_detail::kStateDim) *
-                                       gated_delta_net_detail::kStateDim * problem.value_heads;
-    DeviceBuffer state_in  = make_zeros(state_elements * sizeof(float));
-    DeviceBuffer state_out = make_zeros(state_elements * sizeof(float));
-
-    Tensor q       = operands.query();
-    Tensor k       = operands.key();
-    Tensor v       = operands.value();
-    Tensor g       = operands.gate();
-    Tensor beta    = operands.beta_tensor();
-    Tensor out     = operands.output();
-    Tensor ssm_in  = Tensor(state_in.p, DType::FP32,
-                            {gated_delta_net_detail::kStateDim, gated_delta_net_detail::kStateDim,
-                             problem.value_heads});
-    Tensor ssm_out = Tensor(state_out.p, DType::FP32,
-                            {gated_delta_net_detail::kStateDim, gated_delta_net_detail::kStateDim,
-                             problem.value_heads});
-
-    const std::size_t workspace_bytes = ops::gated_delta_net_workspace_capacity_bytes(
-        problem.qk_heads, problem.value_heads, true, tokens, tokens);
-    WorkspaceArena workspace(std::max<std::size_t>(workspace_bytes, 1));
-    auto launch = [&](cudaStream_t launch_stream) {
-        ops::gated_delta_net(q, k, v, g, beta, gated_delta_net_scale(), true, workspace, ssm_in,
-                             ssm_out, out, launch_stream);
-    };
-    const GraphMeasurement measurement = measure_graph(launch, flush, stream, options);
-    const TrafficBytes traffic         = running_traffic(problem);
-
-    const std::int32_t full_chunks = tokens / gated_delta_net_detail::kChunkSize;
-    return {
-        "running",
-        "fused",
-        running_implementation(tokens),
-        tokens,
-        full_chunks,
-        tokens % gated_delta_net_detail::kChunkSize,
-        workspace_bytes,
-        measurement.graph_nodes,
-        running_logical_bytes(problem),
-        traffic.total,
-        traffic.intermediate,
-        -1.0,
-        -1.0,
-        measurement.timing,
-    };
-}
-
-BenchRow run_snapshot(const Options& options, std::int32_t tokens, DeviceBuffer& flush,
-                      cudaStream_t stream) {
+BenchRow run_batch_update(const Options& options, std::int32_t tokens, DeviceBuffer& flush,
+                          cudaStream_t stream) {
     const Problem problem{options.qk_heads, options.value_heads, tokens, options.batch};
     Operands operands(problem, false);
 
@@ -616,28 +454,14 @@ BenchRow run_snapshot(const Options& options, std::int32_t tokens, DeviceBuffer&
                                     problem.qk_heads * tokens * problem.batch;
     const std::size_t state_elements = static_cast<std::size_t>(gated_delta_net_detail::kStateDim) *
                                        gated_delta_net_detail::kStateDim * problem.value_heads;
-    const std::int32_t slots =
-        problem.batch == 1 ? kSnapshotSlots : problem.batch * tokens + problem.batch;
-    DeviceBuffer states = make_zeros(state_elements * slots * sizeof(float));
-    std::vector<std::int32_t> initial_host(static_cast<std::size_t>(problem.batch));
-    std::vector<std::int32_t> base_host(static_cast<std::size_t>(problem.batch));
-    if (problem.batch == 1) {
-        initial_host[0] = kSnapshotInitialSlot;
-    } else {
-        for (std::int32_t row = 0; row < problem.batch; ++row) {
-            base_host[static_cast<std::size_t>(row)]    = row * tokens;
-            initial_host[static_cast<std::size_t>(row)] = problem.batch * tokens + row;
-        }
+    const std::int32_t slots = problem.batch;
+    DeviceBuffer states      = make_zeros(state_elements * slots * sizeof(float));
+    std::vector<std::int32_t> state_slots_host(static_cast<std::size_t>(problem.batch));
+    for (std::int32_t row = 0; row < problem.batch; ++row) {
+        state_slots_host[static_cast<std::size_t>(row)] = row;
     }
-    DeviceBuffer initial_slot(initial_host.size() * sizeof(std::int32_t));
-    initial_slot.copy_from_host(initial_host.data(), initial_slot.bytes);
-    DeviceBuffer snapshot_base_slot(base_host.size() * sizeof(std::int32_t));
-    snapshot_base_slot.copy_from_host(base_host.data(), snapshot_base_slot.bytes);
-    DeviceBuffer valid_columns;
-    if (!options.valid_columns.empty()) {
-        valid_columns = DeviceBuffer(options.valid_columns.size() * sizeof(std::int32_t));
-        valid_columns.copy_from_host(options.valid_columns.data(), valid_columns.bytes);
-    }
+    DeviceBuffer state_slots(state_slots_host.size() * sizeof(std::int32_t));
+    state_slots.copy_from_host(state_slots_host.data(), state_slots.bytes);
     DeviceBuffer q_normalized;
     DeviceBuffer k_normalized;
     if (options.qk_norm == "composed") {
@@ -654,12 +478,7 @@ BenchRow run_snapshot(const Options& options, std::int32_t tokens, DeviceBuffer&
     Tensor ssm_states(states.p, DType::FP32,
                       {gated_delta_net_detail::kStateDim, gated_delta_net_detail::kStateDim,
                        problem.value_heads, slots});
-    Tensor valid;
-    if (!options.valid_columns.empty()) {
-        valid = Tensor(valid_columns.p, DType::I32, {problem.batch});
-    }
-    Tensor initial(initial_slot.p, DType::I32, {problem.batch});
-    Tensor snapshot_base(snapshot_base_slot.p, DType::I32, {problem.batch});
+    Tensor selected_slots(state_slots.p, DType::I32, {problem.batch});
     Tensor q_norm;
     Tensor k_norm;
     if (options.qk_norm == "composed") {
@@ -679,25 +498,24 @@ BenchRow run_snapshot(const Options& options, std::int32_t tokens, DeviceBuffer&
         }
         const Tensor& q_input = composed ? q_norm : q;
         const Tensor& k_input = composed ? k_norm : k;
-        ops::gated_delta_net_snapshot(q_input, k_input, v, g, beta, gated_delta_net_scale(),
-                                              !composed, ssm_states, valid, initial, snapshot_base, out,
-                                              launch_stream);
+        ops::gated_delta_net_batch_update(q_input, k_input, v, g, beta, gated_delta_net_scale(),
+                                                  !composed, ssm_states, selected_slots, out,
+                                                  launch_stream);
     };
     const GraphMeasurement measurement = measure_graph(launch, flush, stream, options);
-    const TrafficBytes traffic         = snapshot_traffic(problem, composed);
+    const TrafficBytes traffic         = batch_update_traffic(problem, composed);
 
     return {
-        "snapshot",
+        "batch_update",
         composed ? "composed" : "fused",
-        composed                        ? "l2norm_x2+public.snapshot.qk_pre_normalized"
-        : options.valid_columns.empty() ? "public.snapshot.qk_fused"
-                                        : "public.snapshot.masked.qk_fused",
+        composed ? "l2norm_x2+public.batch_update.qk_pre_normalized"
+                 : "public.batch_update.qk_fused",
         tokens,
         0,
         0,
         0,
         measurement.graph_nodes,
-        snapshot_logical_bytes(problem),
+        batch_update_logical_bytes(problem),
         traffic.total,
         traffic.intermediate,
         -1.0,
@@ -706,151 +524,100 @@ BenchRow run_snapshot(const Options& options, std::int32_t tokens, DeviceBuffer&
     };
 }
 
-std::vector<BenchRow> run_chunked(const Options& options, std::int32_t tokens, DeviceBuffer& flush,
-                                  cudaStream_t stream) {
+std::vector<BenchRow> run_prefill(const Options& options, std::int32_t tokens, DeviceBuffer& flush,
+                                  DeviceExecutionView execution) {
+    constexpr auto state_dim = gated_delta_net_detail::kStateDim;
+    const bool normalize     = options.mode != Mode::ChunkedOnly;
+    const bool force_chunked =
+        options.mode == Mode::ChunkedOnly || options.mode == Mode::ForceChunked;
+    const bool force_recurrent = options.mode == Mode::RecurrentOnly;
+    const bool chunked =
+        force_chunked || (!force_recurrent && tokens >= chunked_detail::kMinTokens);
     const Problem problem{options.qk_heads, options.value_heads, tokens};
-    Operands operands(problem, true);
-
-    const std::size_t state_elements = static_cast<std::size_t>(gated_delta_net_detail::kStateDim) *
-                                       gated_delta_net_detail::kStateDim * problem.value_heads;
-    DeviceBuffer state_in             = make_zeros(state_elements * sizeof(float));
-    DeviceBuffer state_out            = make_zeros(state_elements * sizeof(float));
-    const std::size_t workspace_bytes = ops::gated_delta_net_workspace_capacity_bytes(
-        problem.qk_heads, problem.value_heads, false, tokens, tokens);
-    DeviceBuffer workspace = make_zeros(workspace_bytes);
-
-    Tensor q       = operands.query();
-    Tensor k       = operands.key();
-    Tensor v       = operands.value();
-    Tensor g       = operands.gate();
-    Tensor beta    = operands.beta_tensor();
-    Tensor out     = operands.output();
-    Tensor ssm_in  = Tensor(state_in.p, DType::FP32,
-                            {gated_delta_net_detail::kStateDim, gated_delta_net_detail::kStateDim,
-                             problem.value_heads});
-    Tensor ssm_out = Tensor(state_out.p, DType::FP32,
-                            {gated_delta_net_detail::kStateDim, gated_delta_net_detail::kStateDim,
-                             problem.value_heads});
-
-    WorkspaceArena pipeline_workspace(DeviceSpan{workspace.p, workspace.bytes});
-    auto pipeline = [&](cudaStream_t launch_stream) {
-        ops::gated_delta_net(q, k, v, g, beta, gated_delta_net_scale(), false, pipeline_workspace,
-                             ssm_in, ssm_out, out, launch_stream);
-    };
-    const GraphMeasurement pipeline_measurement = measure_graph(pipeline, flush, stream, options);
-    const TrafficBytes pipeline_traffic         = chunked_pipeline_traffic(problem);
-
-    std::vector<BenchRow> rows;
-    rows.push_back({
-        "running",
-        "pre_normalized",
-        "public.chunked.qk_pre_normalized",
-        tokens,
-        tokens / gated_delta_net_detail::kChunkSize,
-        0,
-        workspace_bytes,
-        pipeline_measurement.graph_nodes,
-        running_logical_bytes(problem),
-        pipeline_traffic.total,
-        pipeline_traffic.intermediate,
-        -1.0,
-        options.breakdown ? 100.0 : -1.0,
-        pipeline_measurement.timing,
-    });
-    if (!options.breakdown) { return rows; }
-
-    const chunked_detail::workspace_layout layout =
-        chunked_detail::compute_workspace_layout(problem.value_heads, tokens);
-    const DeviceSpan backing{workspace.p, workspace.bytes};
-    const Tensor g_cumsum = layout.g_cumsum.bind(backing);
-    const Tensor W        = layout.W.bind(backing);
-    const Tensor U        = layout.U.bind(backing);
-    const Tensor v_new    = layout.v_new.bind(backing);
-    const Tensor h_chunk  = layout.h_chunk.bind(backing);
-
-    chunked_detail::prepare_wy_wu_config prepare{};
-    prepare.H_qk         = problem.qk_heads;
-    prepare.H_v          = problem.value_heads;
-    prepare.L            = tokens;
-    prepare.k            = static_cast<const __nv_bfloat16*>(k.data);
-    prepare.v            = static_cast<const __nv_bfloat16*>(v.data);
-    prepare.g_in         = static_cast<const float*>(g.data);
-    prepare.beta         = static_cast<const float*>(beta.data);
-    prepare.W            = static_cast<__nv_bfloat16*>(W.data);
-    prepare.U            = static_cast<__nv_bfloat16*>(U.data);
-    prepare.g_cumsum_out = static_cast<float*>(g_cumsum.data);
-
-    chunked_detail::state_passing_config state{};
-    state.H_qk      = problem.qk_heads;
-    state.H_v       = problem.value_heads;
-    state.L         = tokens;
-    state.W         = static_cast<const __nv_bfloat16*>(W.data);
-    state.U         = static_cast<const __nv_bfloat16*>(U.data);
-    state.k         = static_cast<const __nv_bfloat16*>(k.data);
-    state.g_cumsum  = static_cast<const float*>(g_cumsum.data);
-    state.state_in  = static_cast<const float*>(ssm_in.data);
-    state.v_new     = static_cast<__nv_bfloat16*>(v_new.data);
-    state.h_chunk   = static_cast<__nv_bfloat16*>(h_chunk.data);
-    state.state_out = static_cast<float*>(ssm_out.data);
-
-    chunked_detail::chunk_output_config output{};
-    output.H_qk     = problem.qk_heads;
-    output.H_v      = problem.value_heads;
-    output.L        = tokens;
-    output.q        = static_cast<const __nv_bfloat16*>(q.data);
-    output.k        = static_cast<const __nv_bfloat16*>(k.data);
-    output.v_new    = static_cast<const __nv_bfloat16*>(v_new.data);
-    output.g_cumsum = static_cast<const float*>(g_cumsum.data);
-    output.h_chunk  = static_cast<const __nv_bfloat16*>(h_chunk.data);
-    output.attn_out = static_cast<__nv_bfloat16*>(out.data);
-    output.scale    = gated_delta_net_scale();
-
-    const auto append_stage = [&](const char* implementation, const TrafficBytes& traffic,
-                                  auto& launch) {
-        const GraphMeasurement measurement = measure_graph(launch, flush, stream, options);
-        rows.push_back({
-            "running",
-            "pre_normalized",
-            implementation,
-            tokens,
-            tokens / gated_delta_net_detail::kChunkSize,
-            0,
-            workspace_bytes,
-            measurement.graph_nodes,
-            0.0,
-            traffic.total,
-            traffic.intermediate,
-            0.0,
-            100.0 * measurement.timing.median_us / pipeline_measurement.timing.median_us,
-            measurement.timing,
-        });
-    };
-
-    auto launch_prepare = [&](cudaStream_t launch_stream) {
-        prepare.stream = launch_stream;
-        CUDA_CHECK(chunked_detail::launch_prepare_wy_wu(prepare));
-    };
-    append_stage("chunked.prepare_wy_wu", chunked_prepare_traffic(problem), launch_prepare);
-
-    auto launch_state = [&](cudaStream_t launch_stream) {
-        state.stream = launch_stream;
-        CUDA_CHECK(chunked_detail::launch_state_passing(state));
-    };
-    append_stage("chunked.state_passing", chunked_state_traffic(problem), launch_state);
-
-    auto launch_output = [&](cudaStream_t launch_stream) {
-        output.stream = launch_stream;
-        CUDA_CHECK(chunked_detail::launch_output(output));
-    };
-    append_stage("chunked.output", chunked_output_traffic(problem), launch_output);
-
-    double stage_sum_us = 0.0;
-    for (std::size_t index = 1; index < rows.size(); ++index) {
-        stage_sum_us += rows[index].timing.median_us;
+    Operands operands(problem, !normalize);
+    const std::size_t state_elements = std::size_t(state_dim) * state_dim * problem.value_heads;
+    DeviceBuffer state_in            = make_zeros(state_elements * sizeof(float));
+    DeviceBuffer state_out           = make_zeros(state_elements * sizeof(float));
+    Tensor q = operands.query(), k = operands.key(), v = operands.value();
+    Tensor g = operands.gate(), beta = operands.beta_tensor(), out = operands.output();
+    Tensor si(state_in.p, DType::FP32, {state_dim, state_dim, problem.value_heads});
+    Tensor so(state_out.p, DType::FP32, {state_dim, state_dim, problem.value_heads});
+    const auto layout =
+        chunked_detail::workspace_layout(problem.qk_heads, problem.value_heads, tokens);
+    std::size_t bytes = 0;
+    if (force_chunked) {
+        bytes = layout.total_bytes;
+    } else if (!force_recurrent) {
+        bytes = ops::gated_delta_net_workspace_capacity_bytes(problem.qk_heads, problem.value_heads,
+                                                              tokens, tokens);
     }
-    for (std::size_t index = 1; index < rows.size(); ++index) {
-        rows[index].stage_share_pct =
-            stage_sum_us > 0.0 ? 100.0 * rows[index].timing.median_us / stage_sum_us : 0.0;
+    WorkspaceArena workspace(std::max<std::size_t>(256, bytes));
+    const DeviceSpan backing{workspace.base(), bytes};
+    auto* qk =
+        chunked ? static_cast<chunked_detail::QkChunk*>(layout.qk.bind(backing).data) : nullptr;
+    auto* control =
+        chunked ? static_cast<chunked_detail::ControlChunk*>(layout.control.bind(backing).data)
+                : nullptr;
+    const chunked_detail::Arguments args{static_cast<const __nv_bfloat16*>(q.data),
+                                         static_cast<const __nv_bfloat16*>(k.data),
+                                         static_cast<const __nv_bfloat16*>(v.data),
+                                         static_cast<const float*>(g.data),
+                                         static_cast<const float*>(beta.data),
+                                         static_cast<const float*>(si.data),
+                                         static_cast<float*>(so.data),
+                                         static_cast<__nv_bfloat16*>(out.data),
+                                         problem.qk_heads,
+                                         problem.value_heads,
+                                         tokens,
+                                         gated_delta_net_scale()};
+    const int tile =
+        chunked ? chunked_detail::value_tile(problem.value_heads, execution.multiprocessor_count)
+                : 0;
+    const auto prep_io          = prepare_traffic(problem, bytes);
+    const auto rec_io           = recurrence_traffic(problem, tile ? state_dim / tile : 0);
+    const TrafficBytes total_io = chunked ? TrafficBytes{prep_io.total + rec_io.total,
+                                                         prep_io.intermediate + rec_io.intermediate}
+                                          : TrafficBytes{running_logical_bytes(problem), 0};
+    auto prepare                = [&](cudaStream_t stream) {
+        chunked_detail::launch_prepare(args, qk, control, normalize, stream);
+    };
+    auto recurrence = [&](cudaStream_t stream) {
+        chunked_detail::launch_recurrence(args, qk, control,
+                                          {stream, execution.multiprocessor_count});
+    };
+    auto pipeline = [&](cudaStream_t stream) {
+        if (force_chunked) {
+            prepare(stream);
+            recurrence(stream);
+        } else if (force_recurrent)
+            gated_delta_net_detail::launch_recurrent_inout(
+                q, k, v, g, beta, gated_delta_net_scale(), normalize, si, so, out, stream);
+        else
+            ops::gated_delta_net(q, k, v, g, beta, gated_delta_net_scale(), normalize, workspace,
+                                 si, so, out, {stream, execution.multiprocessor_count});
+    };
+    std::vector<BenchRow> rows;
+    auto measure = [&](const char* name, TrafficBytes io, auto& body, double logical) {
+        const auto measured = measure_graph(body, flush, execution.stream, options);
+        rows.push_back({"running", normalize ? "fused" : "pre_normalized", name, tokens,
+                        chunked ? tokens / chunked_detail::kChunkSize : 0,
+                        chunked ? tokens % chunked_detail::kChunkSize : 0, bytes,
+                        measured.graph_nodes, logical, io.total, io.intermediate, -1.0, -1.0,
+                        measured.timing});
+    };
+    measure(force_chunked     ? "forced.chunked"
+            : force_recurrent ? "forced.recurrent"
+                              : "public.total",
+            total_io, pipeline, running_logical_bytes(problem));
+    if (options.breakdown && chunked) {
+        measure("chunked.prepare", prep_io, prepare, 0);
+        measure("chunked.recurrence", rec_io, recurrence, 0);
+        const double sum = rows[1].timing.median_us + rows[2].timing.median_us;
+        for (int i = 1; i < 3; ++i) {
+            rows[i].stage_share_pct = 100.0 * rows[i].timing.median_us / sum;
+            rows[i].relative_to_e2e_pct =
+                100.0 * rows[i].timing.median_us / rows[0].timing.median_us;
+        }
     }
     return rows;
 }
@@ -868,9 +635,9 @@ double traffic_gbps(const BenchRow& row) {
 void print_csv_header() {
     std::printf(
         "state_form,normalization,implementation,dtype,state_dim,qk_heads,value_heads,tokens,"
-        "batch,full_chunks,tail_tokens,workspace_bytes,logical_bytes,traffic_bytes,"
-        "intermediate_traffic_bytes,graph_nodes,cache,execution,warmup,repeat,"
-        "median_us,min_us,p95_us,logical_gbps,traffic_gbps,stage_share_pct,"
+        "batch,full_chunks,tail_tokens,workspace_bytes,logical_bytes,tensor_io_request_bytes,"
+        "workspace_request_bytes,graph_nodes,cache,execution,warmup,repeat,"
+        "median_us,min_us,p95_us,logical_gbps,tensor_io_request_gbps,stage_share_pct,"
         "relative_to_e2e_pct\n");
 }
 
@@ -892,7 +659,7 @@ void print_row(const BenchRow& row, const Options& options) {
         return;
     }
 
-    std::printf("%-8s T=%-4d B=%-2d chunks=%-2d tail=%-2d nodes=%zu ws=%7.2f MiB "
+    std::printf("%-8s T=%-4d B=%-2d full_chunks=%-2d tail=%-2d nodes=%zu ws=%7.2f MiB "
                 "median=%8.3f us min=%8.3f us p95=%8.3f us",
                 row.state_form, row.tokens, options.batch, row.full_chunks, row.tail_tokens,
                 row.graph_nodes,
@@ -923,7 +690,8 @@ void print_banner(const Options& options, const cudaDeviceProp& device) {
     std::printf("  execution   CUDA Graph replay\n");
     std::printf("  cache       cold L2 (%zu MiB flush before each sample)\n",
                 options.flush_bytes >> 20);
-    std::printf("  traffic     kernel tensor I/O including materialized intermediates\n");
+    std::printf(
+        "  traffic     CTA tensor I/O requests including replicated packets (not measured DRAM)\n");
     std::printf("  samples     %d warmup + %d measured per case\n\n", options.warmup,
                 options.repeat);
 }
@@ -952,14 +720,12 @@ int main(int argc, char** argv) {
 
         for (const std::int32_t tokens : token_values(options)) {
             validate_tokens(options, tokens);
-            if (options.mode == Mode::Running) {
-                print_row(run_running(options, tokens, flush, stream), options);
-            } else if (options.mode == Mode::Snapshot) {
-                print_row(run_snapshot(options, tokens, flush, stream), options);
+            if (options.mode == Mode::BatchUpdate) {
+                print_row(run_batch_update(options, tokens, flush, stream), options);
             } else {
-                for (const BenchRow& row : run_chunked(options, tokens, flush, stream)) {
+                for (const BenchRow& row :
+                     run_prefill(options, tokens, flush, {stream, device.multiProcessorCount}))
                     print_row(row, options);
-                }
             }
         }
 

@@ -319,7 +319,11 @@ int run_case(const FoldProfile profile, std::int32_t width, std::int32_t rows,
                               {kStateDim, kStateDim, profile.value_heads});
     Tensor output(out.p, DType::BF16, {kStateDim, profile.value_heads, width, 1});
     const float kScale = 1.0F / std::sqrt(128.0F);
-    WorkspaceArena reference_workspace(256);
+    // A commit equal to the chunked threshold takes the tiled route, which needs the real
+    // workspace; a hardcoded stub only survives while every commit stays below it.
+    WorkspaceArena reference_workspace(std::max<std::size_t>(
+        256, ops::gated_delta_net_workspace_capacity_bytes(kQkHeads, profile.value_heads, 1,
+                                                           width)));
 
     for (std::int32_t layer = 0; layer < profile.layers; ++layer) {
         const GdnReplayRecordLayer layer_records = records.layer(layer, rows);
@@ -415,6 +419,14 @@ int run_case(const FoldProfile profile, std::int32_t width, std::int32_t rows,
             cuda_check(cudaMemcpy(expected_recurrent_host.data(), expected_state,
                                   recurrent_slot_bytes, cudaMemcpyDeviceToHost),
                        "download expected recurrent state");
+            // The reference call must stay on the same route as the fold path, because this
+            // check exists for the fold BOOKKEEPING - which record feeds which slot - and its
+            // whole value is exact equality. Once a commit reaches the tiled threshold the
+            // reference switches route, and tiled against recurrent disagrees by ~1e-4 absolute
+            // on BF16 inputs (measured 2026-09-28), which no honest tolerance would separate
+            // from a real fold defect. Each route is qualified against the independent oracle
+            // in its own test instead; every commit here therefore stays below the threshold,
+            // which the case list enforces.
             if (actual_recurrent != expected_recurrent_host) {
                 std::cerr << "fold recurrent state differs from direct prefix" << suffix
                           << " layer=" << layer << " row=" << row << "\n";
@@ -615,7 +627,9 @@ int run_record_fold_rounds() {
                                                                  kWidth);
     WorkspaceArena snapshot_workspace(std::max<std::size_t>(256, snapshot_workspace_bytes));
     WorkspaceArena record_workspace(std::max<std::size_t>(256, record_workspace_bytes));
-    WorkspaceArena recurrent_workspace(256);
+    WorkspaceArena recurrent_workspace(std::max<std::size_t>(
+        256, ops::gated_delta_net_workspace_capacity_bytes(kQkHeads, kProfile.value_heads, 1,
+                                                           kWidth)));
 
     int failures = 0;
     for (std::int32_t round = 0; round < 2; ++round) {
@@ -739,7 +753,9 @@ int run_record_fold_rounds() {
 
 } // namespace
 
-int main() {
+int main() try {
+    std::cout << std::unitbuf;
+    std::cerr << std::unitbuf;
     if (cuda_unavailable()) {
         std::cout << "SKIP: no usable CUDA device\n";
         return 77;
@@ -752,8 +768,13 @@ int main() {
     failures += run_case({30, 32, 8192}, 2, 1, {2}, 1831U);
     failures += run_case({30, 32, 8192}, 6, 1, {6}, 1841U);
     failures += run_case({30, 32, 8192}, 6, 2, {2, 5}, 1851U);
-    failures += run_case({30, 32, 8192}, 16, 8, {0, 1, 2, 3, 16, 7, 12, 5}, 1861U);
+    // Commit 15, not 16: at 16 the reference prefix would switch to the tiled route and the
+    // exact comparison above would compare two routes instead of the fold bookkeeping.
+    failures += run_case({30, 32, 8192}, 16, 8, {0, 1, 2, 3, 15, 7, 12, 5}, 1861U);
     failures += run_record_fold_rounds();
     std::cout << (failures == 0 ? "OK" : "FAIL") << " gdn_replay_fold\n";
     return failures == 0 ? 0 : 1;
+} catch (const std::exception& e) {
+    std::cerr << "EXCEPTION: " << e.what() << "\n";
+    return 2;
 }

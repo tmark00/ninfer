@@ -75,6 +75,13 @@ private:
     [[nodiscard]] std::shared_ptr<RequestLifecycle> begin_request(RequestLogContext context);
 
     void register_routes();
+    // WebUI: statyczny mount plus fallback SPA. Upstream nie ma wlasnego interfejsu,
+    // wiec to jest port z galezi v2 tego forka.
+    void mount_webui(const std::string& webui_dir);
+    void register_webui_mime();
+    [[nodiscard]] bool webui_spa_path(const std::string& path) const;
+    void handle_props(const httplib::Request& req, httplib::Response& res) const;
+    void handle_mcp_proxy(const httplib::Request& req, httplib::Response& res);
     void handle_chat_completions(const httplib::Request& req, httplib::Response& res);
     void handle_messages(const httplib::Request& req, httplib::Response& res);
     void handle_count_tokens(const httplib::Request& req, httplib::Response& res);
@@ -104,6 +111,8 @@ private:
     OperationalLog operational_log_;
     JsonlRequestLog request_jsonl_;
     httplib::Server server_;
+    bool webui_serving_ = false;
+    std::string webui_index_html_;
     std::atomic<std::uint64_t> request_seq_{0};
     std::mutex stats_mutex_;
     std::condition_variable stats_cv_;

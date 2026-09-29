@@ -868,6 +868,10 @@ void parse_output_limit(const Json& body, const RequestLimits& limits, OpenAICha
         limit = optional_int(body, "max_tokens");
         param = "max_tokens";
     }
+    // -1 is the llama.cpp dialect's "no explicit limit" and the webui sends it on every
+    // request. It falls back to the server default exactly like an omitted field; any
+    // other negative value is still rejected.
+    if (limit && *limit == -1) { limit.reset(); }
     if (limit) {
         if (*limit < 0) { bad_request(std::string(param) + " must be nonnegative", param); }
         output.generation.max_tokens  = *limit;
@@ -886,11 +890,16 @@ OpenAIChatRequest parse_chat_completion_request(const Json& body, const RequestL
     validate_compatibility_hints(body);
 
     OpenAIChatRequest output;
-    if (!body.contains("model") || !body.at("model").is_string() ||
-        body.at("model").get<std::string>().empty()) {
-        bad_request("missing required field: model", "model");
+    // Single-model clients such as the llama.cpp webui send an empty model or none at all.
+    // Leave it empty here; the HTTP layer knows the served model and substitutes it, so the
+    // request is served against the loaded artifact instead of being rejected. A model that
+    // is present but not a string is still a malformed request.
+    if (body.contains("model") && !body.at("model").is_null() && !body.at("model").is_string()) {
+        bad_request("model must be a string", "model");
     }
-    output.model = body.at("model").get<std::string>();
+    if (body.contains("model") && body.at("model").is_string()) {
+        output.model = body.at("model").get<std::string>();
+    }
 
     const OpenAIPromptCachePolicy cache_policy = parse_openai_prompt_cache_policy(body);
 

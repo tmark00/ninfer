@@ -18,6 +18,8 @@ add_library(ninfer_serve STATIC
   operational_log.cpp
   request_log.cpp
   http_server.cpp
+  $<$<BOOL:${WIN32}>:webui_update.cpp>
+  mcp_proxy.cpp
   openai_responses_http.cpp
   serve_options.cpp
 )

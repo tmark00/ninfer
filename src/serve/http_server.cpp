@@ -1,4 +1,11 @@
 #include "serve/http_server.h"
+#include <spdlog/spdlog.h>
+#include <fstream>
+#include "serve/mcp_proxy.h"
+#include <condition_variable>
+#include <deque>
+#include <mutex>
+#include <thread>
 
 #include "serve/anthropic_messages.h"
 #include "serve/http_transport.h"
@@ -226,6 +233,10 @@ HttpServer::HttpServer(ServeOptions options, std::shared_ptr<spdlog::logger> log
     };
     server_.set_socket_options(configure_http_server_socket);
     server_.set_payload_max_length(options_.max_request_bytes);
+    if (!options_.webui_dir.empty()) {
+        mount_webui(options_.webui_dir);
+        register_webui_mime();
+    }
     register_routes();
 }
 
@@ -332,8 +343,301 @@ void HttpServer::stop_stats_reporter() {
     stats_thread_.join();
 }
 
+namespace {
+
+// One upstream MCP exchange in flight for the webui's relay. cpp-httplib writes
+// this server's status and headers when the route handler returns, but the
+// upstream status is only known once the request is on the wire, so the call runs
+// on its own thread and the handler blocks until the response head arrives. The
+// body then flows through the queue into a chunked provider, which is what keeps
+// the long-lived MCP GET channel streaming instead of buffering it whole.
+struct McpProxyRelay {
+    std::mutex mutex;
+    std::condition_variable cv;
+    std::deque<std::string> chunks;
+    bool head_ready = false;
+    bool finished   = false;
+    bool abandoned  = false; // the browser hung up; stop draining upstream
+    int status      = 0;
+    httplib::Headers response_headers;
+    std::string error;
+    std::thread worker;
+
+    ~McpProxyRelay() {
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            abandoned = true;
+        }
+        if (worker.joinable()) { worker.join(); }
+    }
+};
+
+void run_mcp_proxy(std::shared_ptr<McpProxyRelay> relay, McpProxyTarget target, std::string method,
+                   httplib::Headers headers, std::string body) {
+    httplib::Client client(target.host, target.port);
+    client.set_connection_timeout(std::chrono::seconds(5));
+    // The MCP GET channel stays open for the life of the session and is silent
+    // between events, so a short read timeout would tear it down mid-session.
+    client.set_read_timeout(std::chrono::hours(1));
+    client.set_write_timeout(std::chrono::seconds(30));
+    client.set_keep_alive(false);
+
+    httplib::Request upstream;
+    upstream.method           = std::move(method);
+    upstream.path             = target.path;
+    upstream.headers          = std::move(headers);
+    upstream.body             = std::move(body);
+    upstream.response_handler = [relay](const httplib::Response& response) {
+        {
+            std::lock_guard<std::mutex> lock(relay->mutex);
+            relay->status           = response.status;
+            relay->response_headers = response.headers;
+            relay->head_ready       = true;
+        }
+        relay->cv.notify_all();
+        return true;
+    };
+    upstream.content_receiver = [relay](const char* data, std::size_t length, std::uint64_t,
+                                        std::uint64_t) {
+        {
+            std::lock_guard<std::mutex> lock(relay->mutex);
+            if (relay->abandoned) { return false; }
+            relay->chunks.emplace_back(data, length);
+        }
+        relay->cv.notify_all();
+        return true;
+    };
+
+    const httplib::Result result = client.send(upstream);
+    {
+        std::lock_guard<std::mutex> lock(relay->mutex);
+        // A transport failure after the head arrived is a truncated stream, not a
+        // failed request: the status is already on its way to the browser.
+        if (!result && !relay->head_ready) { relay->error = httplib::to_string(result.error()); }
+        relay->finished = true;
+    }
+    relay->cv.notify_all();
+}
+
+// llama.cpp webui dialect: /props is the client's server introspection endpoint
+// (role detection, context size, default params, thinking-capability probe, api
+// key validation). NInfer has no llama.cpp server behind it, so serve a faithful
+// stub derived from the process configuration. Only process-level overrides are
+// reported as parameter values; everything else stays at neutral zeros so client
+// side defaults never swallow a user-set request parameter.
+nlohmann::json make_props_stub(const ServeOptions& options) {
+    const auto& ov = options.sampling_overrides;
+    nlohmann::json params = nlohmann::json::object();
+    params["n_predict"]         = options.default_max_tokens;
+    params["seed"]              = ov.seed ? static_cast<double>(*ov.seed) : 0;
+    params["temperature"]       = ov.temperature ? static_cast<double>(*ov.temperature) : 0;
+    params["dynatemp_range"]    = 0;
+    params["dynatemp_exponent"] = 0;
+    params["top_k"]             = ov.top_k ? *ov.top_k : 0;
+    params["top_p"]             = ov.top_p ? static_cast<double>(*ov.top_p) : 0;
+    params["min_p"]             = ov.min_p ? static_cast<double>(*ov.min_p) : 0;
+    params["top_n_sigma"]       = 0;
+    params["xtc_probability"]   = 0;
+    params["xtc_threshold"]     = 0;
+    params["typ_p"]             = 0;
+    params["repeat_last_n"]     = 0;
+    params["repeat_penalty"]    = 0;
+    params["presence_penalty"]  = ov.presence_penalty ? static_cast<double>(*ov.presence_penalty) : 0;
+    params["frequency_penalty"] =
+        ov.frequency_penalty ? static_cast<double>(*ov.frequency_penalty) : 0;
+    params["dry_multiplier"]        = 0;
+    params["dry_base"]              = 0;
+    params["dry_allowed_length"]    = 0;
+    params["dry_penalty_last_n"]    = 0;
+    params["dry_sequence_breakers"] = nlohmann::json::array();
+    params["mirostat"]              = 0;
+    params["mirostat_tau"]          = 0;
+    params["mirostat_eta"]          = 0;
+    params["stop"]                  = nlohmann::json::array();
+    params["max_tokens"]            = options.default_max_tokens;
+    params["n_keep"]                = 0;
+    params["n_discard"]             = 0;
+    params["ignore_eos"]            = false;
+    params["stream"]                = false;
+    params["logit_bias"]            = nlohmann::json::array();
+    params["n_probs"]               = 0;
+    params["min_keep"]              = 0;
+    params["grammar"]               = "";
+    params["grammar_lazy"]          = false;
+    params["grammar_triggers"]      = nlohmann::json::array();
+    params["preserved_tokens"]      = nlohmann::json::array();
+    params["chat_format"]           = "";
+    params["reasoning_format"]      = "";
+    params["reasoning_in_content"]  = false;
+    params["generation_prompt"]     = "";
+    params["samplers"]              = nlohmann::json::array();
+    params["backend_sampling"]      = false;
+    params["speculative.n_max"]     = 0;
+    params["speculative.n_min"]     = 0;
+    params["speculative.p_min"]     = 0.0;
+    params["timings_per_token"]     = false;
+    params["post_sampling_probs"]   = false;
+    params["lora"]                  = nlohmann::json::array();
+
+    nlohmann::json props                 = nlohmann::json::object();
+    props["default_generation_settings"] = {
+        {"id", 0},
+        {"id_task", 0},
+        {"n_ctx", static_cast<int>(options.max_context)},
+        {"speculative", options.speculative.backend != SpeculativeBackend::None},
+        {"is_processing", false},
+        {"params", params},
+        {"prompt", ""},
+        {"next_token",
+         {{"has_next_token", false},
+          {"has_new_line", false},
+          {"n_remain", 0},
+          {"n_decoded", 0},
+          {"stopping_word", ""}}},
+    };
+    props["total_slots"] = 1;
+    props["model_path"]  = options.artifact_path;
+    props["role"]        = "model";
+    // The webui ungreys its "Use llama-server proxy" option from this flag alone;
+    // without it the relay route is unreachable from the UI even when it is running.
+    props["cors_proxy_enabled"] = options.webui_mcp_proxy;
+    props["modalities"] = {{"vision", options.enable_vision}, {"audio", false}, {"video", false}};
+    // Capability marker only: clients that probe the chat template (e.g. the
+    // webui's thinking-support heuristic) need `enable_thinking` to appear; the
+    // real template is embedded in the loaded artifact.
+    props["chat_template"] =
+        "{# ninfer-serve: capability marker; the real chat template is embedded in "
+        "the loaded artifact #}\n"
+        "{%- if enable_thinking is defined %}\n"
+        "  {%- set thinking = enable_thinking %}\n"
+        "{% endif %}";
+    props["bos_token"]  = "";
+    props["eos_token"]  = "";
+    props["build_info"] = "ninfer-serve";
+    return props;
+}
+
+} // namespace
+
+void HttpServer::handle_props(const httplib::Request&, httplib::Response& res) const {
+    res.set_content(make_props_stub(options_).dump(), "application/json");
+}
+
+void HttpServer::handle_mcp_proxy(const httplib::Request& req, httplib::Response& res) {
+    const McpProxyRequest parsed = parse_mcp_proxy_request(req);
+    if (!parsed.ok) {
+        ApiError error;
+        error.status  = 400;
+        error.type    = "invalid_request_error";
+        error.code    = "invalid_proxy_target";
+        error.message = "mcp proxy: " + parsed.error;
+        write_openai_error(res, error);
+        return;
+    }
+
+    auto relay = std::make_shared<McpProxyRelay>();
+    relay->worker =
+        std::thread(run_mcp_proxy, relay, parsed.target, req.method, parsed.headers, req.body);
+
+    std::unique_lock<std::mutex> lock(relay->mutex);
+    relay->cv.wait(lock, [&relay] { return relay->head_ready || relay->finished; });
+    if (!relay->head_ready) {
+        const std::string reason = relay->error.empty() ? "upstream request failed" : relay->error;
+        lock.unlock();
+        ApiError error;
+        error.status  = 502;
+        error.type    = "upstream_error";
+        error.code    = "proxy_target_unreachable";
+        error.message = "mcp proxy: " + reason;
+        write_openai_error(res, error);
+        return;
+    }
+    res.status                              = relay->status;
+    const httplib::Headers upstream_headers = relay->response_headers;
+    lock.unlock();
+
+    std::string content_type = "application/octet-stream";
+    for (const auto& [name, value] : upstream_headers) {
+        if (is_hop_by_hop_response_header(name)) { continue; }
+        // The chunked provider owns Content-Type; setting it here too would emit
+        // the header twice.
+        if (header_name_is(name, "content-type")) {
+            content_type = value;
+            continue;
+        }
+        res.set_header(name, value);
+    }
+
+    res.set_chunked_content_provider(
+        content_type, [relay](std::size_t, httplib::DataSink& sink) -> bool {
+            std::unique_lock<std::mutex> lock(relay->mutex);
+            relay->cv.wait(lock, [&relay] { return !relay->chunks.empty() || relay->finished; });
+            std::deque<std::string> ready;
+            ready.swap(relay->chunks);
+            const bool drained = relay->finished && ready.empty();
+            lock.unlock();
+
+            for (const std::string& chunk : ready) {
+                if (!sink.write(chunk.data(), chunk.size())) {
+                    std::lock_guard<std::mutex> abandon(relay->mutex);
+                    relay->abandoned = true;
+                    return false;
+                }
+            }
+            if (drained) { sink.done(); }
+            return true;
+        });
+}
+
+void HttpServer::mount_webui(const std::string& webui_dir) {
+    std::ifstream index(webui_dir + "/index.html", std::ios::binary);
+    if (!index) { throw std::runtime_error("webui dir has no index.html: " + webui_dir); }
+    webui_index_html_ =
+        std::string((std::istreambuf_iterator<char>(index)), std::istreambuf_iterator<char>());
+    webui_serving_ = true;
+    if (!server_.set_mount_point("/", webui_dir)) {
+        throw std::runtime_error("cannot mount webui directory: " + webui_dir);
+    }
+    spdlog::info("serving webui from {}", webui_dir);
+}
+
+void HttpServer::register_webui_mime() {
+    // Wbudowana mapa httplib pokrywa typy zasobow tego UI; przypinamy te, od ktorych
+    // zalezy jego ladowanie w przegladarce.
+    server_.set_file_extension_and_mimetype_mapping("js", "text/javascript");
+    server_.set_file_extension_and_mimetype_mapping("css", "text/css");
+    server_.set_file_extension_and_mimetype_mapping("html", "text/html");
+    server_.set_file_extension_and_mimetype_mapping("json", "application/json");
+    server_.set_file_extension_and_mimetype_mapping("svg", "image/svg+xml");
+    server_.set_file_extension_and_mimetype_mapping("ico", "image/x-icon");
+}
+
+bool HttpServer::webui_spa_path(const std::string& path) const {
+    // Fallback SPA lapie WYLACZNIE trasy klienckie. Zasoby obsluzyl mount statyczny, a
+    // sciezki API (/v1/...), /props, /health i pakiety (_app/...) nigdy trasami SPA nie sa:
+    // brakujacy plik _app albo nieznana sciezka /v1 musza dalej konczyc sie 404.
+    if (path.size() < 2 || path[0] != '/') { return false; }
+    if (path == "/") { return false; }
+    if (path.rfind("/v1", 0) == 0 && (path.size() == 3 || path[3] == '/')) { return false; }
+    if (path == "/props" || path == "/health" || path == "/slots" || path == "/tools" ||
+        path == "/v1/streams/lookup" || path == kMcpProxyPath) {
+        return false;
+    }
+    if (path.rfind("/_app/", 0) == 0) { return false; }
+    if (path.find_first_of('.') != std::string::npos) { return false; }
+    return true;
+}
+
 void HttpServer::register_routes() {
     server_.set_error_handler([this](const httplib::Request& request, httplib::Response& response) {
+        // Trasy klienckie UI musza dostac powloke aplikacji; prawdziwe zasoby obsluzyl juz
+        // mount statyczny, a sciezki API maja zostac przy swoim 404.
+        if (webui_serving_ && response.status == 404 && request.method == "GET" &&
+            webui_spa_path(request.path)) {
+            response.set_content(webui_index_html_, "text/html");
+            response.status = 200;
+            return httplib::Server::HandlerResponse::Handled;
+        }
         return handle_unrendered_http_error(options_, request, response);
     });
     if (options_.enable_cors) {
@@ -431,6 +735,20 @@ void HttpServer::register_routes() {
         res.set_content(nlohmann::json{{"status", available ? "ok" : "unavailable"}}.dump(),
                         "application/json");
     });
+    // llama.cpp webui dialect. /props answers whether or not the UI is served here, so a
+    // webui hosted elsewhere can still introspect this server.
+    server_.Get("/props", [this](const httplib::Request& req, httplib::Response& res) {
+        handle_props(req, res);
+    });
+    if (options_.webui_mcp_proxy) {
+        const auto relay = [this](const httplib::Request& req, httplib::Response& res) {
+            handle_mcp_proxy(req, res);
+        };
+        server_.Get(kMcpProxyPath, relay);
+        server_.Post(kMcpProxyPath, relay);
+        server_.Delete(kMcpProxyPath, relay);
+        spdlog::info("webui MCP relay enabled at {}", kMcpProxyPath);
+    }
     server_.Get("/v1/models", [this](const httplib::Request& req, httplib::Response& res) {
         handle_models(req, res);
     });

@@ -82,7 +82,7 @@ std::string serve_usage_text(const char* argv0) {
            "[--default-max-tokens N] [--default-thinking-budget N] "
            "[--vision] [--no-cuda-graph] [--no-prefix-reuse] "
            "[--chat-template FILE] [--lm-head-draft] [--no-thinking] [--preserve-thinking] "
-           "[--cors] "
+           "[--cors] [--webui | --webui-dir DIR] [--webui-mcp-proxy] "
            "[--temperature F] [--top-p F] [--top-k N] [--min-p F] [--presence-penalty F] "
            "[--frequency-penalty F] [--seed N] [--greedy]\n"
            "       [--log-level trace|debug|info|warning|error|critical|off]\n"
@@ -113,7 +113,13 @@ std::string serve_usage_text(const char* argv0) {
            "       --preserve-thinking retains closed-turn assistant reasoning in later prompts\n"
            "       sampler defaults come from the loaded model and resolved thinking mode; "
            "server flags and request fields override individual values.\n"
-           "       --greedy forces temperature 0 (exact argmax).\n";
+           "       --greedy forces temperature 0 (exact argmax).\n"
+           "       --webui auto-downloads the prebuilt llama.cpp webui (ggml-org/llama-ui HF "
+           "bucket) into the webui dir and serves it at / alongside the API\n"
+           "       --webui-dir DIR serves (and for --webui, downloads into) DIR; defaults to "
+           "<model dir>/webui\n"
+           "       --webui-mcp-proxy relays the webui's MCP traffic at /cors-proxy, which its "
+           "\"Use llama-server proxy\" option expects\n";
 }
 
 ServeOptions parse_serve_options(int argc, char** argv) {
@@ -279,6 +285,12 @@ ServeOptions parse_serve_options(int argc, char** argv) {
                 throw std::invalid_argument("--default-thinking-budget is out of range");
             }
             options.default_thinking_budget = static_cast<std::uint32_t>(budget);
+        } else if (arg == "--webui") {
+            options.webui_auto = true;
+        } else if (arg == "--webui-dir") {
+            options.webui_dir = require_value("--webui-dir");
+        } else if (arg == "--webui-mcp-proxy") {
+            options.webui_mcp_proxy = true;
         } else if (arg == "--vision") {
             options.enable_vision = true;
         } else if (arg == "--no-cuda-graph") {

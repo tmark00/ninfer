@@ -54,6 +54,14 @@ struct ServeOptions {
     std::optional<std::uint32_t> default_thinking_budget;
     int default_max_tokens = kDefaultMaxTokens;
     bool enable_cors       = false; // send permissive CORS headers for browser UIs
+    // Ported from this fork's v2 line: upstream serves no browser UI of its own.
+    bool webui_auto = false;        // --webui: fetch the prebuilt llama.cpp webui from the
+                                    // ggml-org/llama-ui HF bucket, then serve it at /
+    std::string webui_dir;          // --webui-dir: serve this directory; also where --webui
+                                    // downloads (default: <artifact dir>/webui)
+    bool webui_mcp_proxy = false;   // --webui-mcp-proxy: relay the webui's MCP traffic at
+                                    // /cors-proxy, which its browser client cannot reach
+                                    // directly because MCP transports answer without CORS
     // Process-level explicit overrides layered between registered model/mode defaults and request
     // fields. An omitted seed is replaced per request with a fresh random seed.
     SamplingOverrides sampling_overrides;

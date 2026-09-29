@@ -1,4 +1,5 @@
 #include "product/logging/logging.h"
+#include "serve/webui_update.h"
 #include "product/logging/startup_log.h"
 #include "serve/generation_service.h"
 #include "serve/http_server.h"
@@ -54,6 +55,20 @@ int main(int argc, char** argv) {
     bool serving = false;
 
     try {
+        // --webui pobiera gotowy interfejs llama.cpp przed startem serwera i podstawia
+        // katalog, ktory HttpServer zamontuje pod /. --webui-dir sam w sobie niczego nie
+        // pobiera, tylko wskazuje gotowa kopie.
+#ifdef _WIN32
+        if (options.webui_auto) {
+            options.webui_dir =
+                ninfer::serve::ensure_webui_available(ninfer::serve::resolve_webui_dir(options));
+        }
+#else
+        if (options.webui_auto) {
+            throw std::runtime_error("--webui auto-download is implemented for Windows only; "
+                                     "use --webui-dir with a prepared copy");
+        }
+#endif
         ninfer::serve::HttpServer server(options, logger);
         if (!server.bind()) {
             operational_log.bind_failure(options.host, options.port);

@@ -7,6 +7,7 @@
 #include "ops/linear/fp8/fp8_a8_mma_common.cuh"
 #include "ops/linear/fp8/fp8_operands.h"
 #include "ops/linear/fp8/fp8_shared.cuh"
+#include "ops/common/tma_descriptor_cache.h"
 
 #include <cuda.h>
 #include <algorithm>
@@ -100,7 +101,7 @@ template <class Schedule, bool FullTokens, class Output, class Epilogue, bool Sp
           class RowPolicy = Fp8IdentityRows>
 __global__
 __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void fp8_a8_tma_mma_kernel(
-    const __grid_constant__ Fp8TmaDescriptors descriptors, Fp8A8Operands operands, Output output,
+    const Fp8TmaDescriptors* descriptors, Fp8A8Operands operands, Output output,
     Epilogue epilogue, RowPolicy row_policy, int token_offset, int count, Fp8TmaSplitKPlan plan,
     float* partials) {
     constexpr int BT = Schedule::kBlockTokens, BR = Schedule::kBlockRows;
@@ -150,7 +151,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void fp8_a8_tma
                 const int stage = kt % S;
                 cta_mbarrier_wait(empty + stage, 1U ^ ((kt / S) & 1U));
                 cta_mbarrier_arrive_expect_tx(full + stage, (BT + BR) * BK);
-                fp8_tma_load(activation + stage * BT * BK, &descriptors.activation,
+                fp8_tma_load(activation + stage * BT * BK, &descriptors->activation,
                              (k_begin + kt) * BK, token_begin, full + stage);
                 if constexpr (RowPolicy::kPaired) {
                     // Each consumer warp owns both gate/up fragments. Load their contiguous
@@ -158,13 +159,13 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void fp8_a8_tma
                     constexpr int span = Schedule::kWarpRows / 2;
 #pragma unroll
                     for (int local = 0; local < BR; local += span) {
-                        fp8_tma_load(weight + (stage * BR + local) * BK, &descriptors.weight,
+                        fp8_tma_load(weight + (stage * BR + local) * BK, &descriptors->weight,
                                      (k_begin + kt) * BK,
                                      row_policy.weight_row(row_begin, local, operands.rows),
                                      full + stage);
                     }
                 } else {
-                    fp8_tma_load(weight + stage * BR * BK, &descriptors.weight, (k_begin + kt) * BK,
+                    fp8_tma_load(weight + stage * BR * BK, &descriptors->weight, (k_begin + kt) * BK,
                                  row_begin, full + stage);
                 }
             }
@@ -292,7 +293,9 @@ void launch_fp8_a8_tma_mma(const Fp8A8Operands& p, Output output, Epilogue epilo
         fp8_tma_map(p.codes, p.rows, p.k, weight_span, Schedule::kBlockK)};
     for_each_token_slice(p.tokens, Schedule::kBlockTokens, [&](int offset, int count) {
         const int blocks  = p.rows / Schedule::kBlockRows * div_up(count, Schedule::kBlockTokens);
-        const auto plan   = fp8_tma_split_k_plan<Schedule>(blocks, p.k);
+        const Fp8TmaDescriptors* descriptors_device =
+        tma_descriptors_device(descriptors, stream);
+    const auto plan   = fp8_tma_split_k_plan<Schedule>(blocks, p.k);
         const auto launch = [&]<bool Full, bool Split>() {
             constexpr auto kernel =
                 fp8_a8_tma_mma_kernel<Schedule, Full, Output, Epilogue, Split, RowPolicy>;
@@ -301,7 +304,8 @@ void launch_fp8_a8_tma_mma(const Fp8A8Operands& p, Output output, Epilogue epilo
             const int dynamic = fp8_prepare_shared<bytes, kernel, true>();
             const int grid    = Split ? plan.full_tiles + plan.split_ctas : blocks;
             kernel<<<grid, Schedule::kThreads, dynamic, stream>>>(
-                descriptors, p, output, epilogue, row_policy, offset, count, plan, partials);
+                descriptors_device, p, output, epilogue, row_policy, offset, count, plan,
+                partials);
             CUDA_CHECK(cudaGetLastError());
             if constexpr (Split) {
                 fp8_a8_tma_split_k_reduce<Schedule>

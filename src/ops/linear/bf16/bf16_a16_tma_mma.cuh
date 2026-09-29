@@ -5,6 +5,7 @@
 #include "ops/linear/bf16/bf16_operands.h"
 #include "ops/common/token_slices.h"
 #include "ops/common/math.h"
+#include "ops/common/tma_descriptor_cache.h"
 #include <cuda.h>
 #include <stdexcept>
 #include <string>
@@ -69,7 +70,7 @@ inline constexpr int bf16_tma_scratch_bytes =
 template <class Schedule, bool FullTokens, class Output, class Epilogue>
 __global__
 __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void bf16_a16_tma_mma_kernel(
-    const __grid_constant__ Bf16TmaDescriptors descriptors, Output output, Epilogue epilogue,
+    const Bf16TmaDescriptors* descriptors, Output output, Epilogue epilogue,
     int rows, int input_rows, int token_offset, int count) {
     constexpr int BR = Schedule::kBlockRows, BT = Schedule::kBlockTokens, BK = Schedule::kBlockK;
     constexpr int S   = Schedule::kStages;
@@ -100,9 +101,9 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void bf16_a16_t
                 const int stage = kt % S;
                 cta_mbarrier_wait(empty + stage, 1U ^ ((kt / S) & 1U));
                 cta_mbarrier_arrive_expect_tx(full + stage, (BR + BT) * BK * 2);
-                bf16_tma_load(a + stage * BR * BK, &descriptors.weight, kt * (BK / 64), row_begin,
+                bf16_tma_load(a + stage * BR * BK, &descriptors->weight, kt * (BK / 64), row_begin,
                               full + stage);
-                bf16_tma_load(b + stage * BT * BK, &descriptors.activation, kt * (BK / 64),
+                bf16_tma_load(b + stage * BT * BK, &descriptors->activation, kt * (BK / 64),
                               token_begin, full + stage);
             }
         }
@@ -129,6 +130,7 @@ void launch_bf16_a16_tma_mma(const Bf16A16Operands& p, Output output, Epilogue e
                              cudaStream_t stream) {
     // Descriptors are launch-owned values, copied into kernel parameters during Graph capture.
     const auto descriptors = make_bf16_tma_descriptors<Schedule>(p);
+    const Bf16TmaDescriptors* descriptors_device = tma_descriptors_device(descriptors, stream);
     for_each_token_slice(p.tokens, Schedule::kBlockTokens, [&](int offset, int count) {
         const auto blocks = static_cast<std::int64_t>(p.rows / Schedule::kBlockRows) *
                             div_up(count, Schedule::kBlockTokens);
@@ -140,7 +142,7 @@ void launch_bf16_a16_tma_mma(const Bf16A16Operands& p, Output output, Epilogue e
                 bf16_tma_scratch_bytes<Schedule, Epilogue> + Schedule::kBarrierBytes;
             bf16_prepare_shared<bytes, kernel>();
             kernel<<<static_cast<unsigned>(blocks), Schedule::kThreads, bytes, stream>>>(
-                descriptors, output, epilogue, p.rows, p.k, offset, count);
+                descriptors_device, output, epilogue, p.rows, p.k, offset, count);
             CUDA_CHECK(cudaGetLastError());
         };
         if (count % Schedule::kBlockTokens == 0)

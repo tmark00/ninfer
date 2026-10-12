@@ -548,6 +548,39 @@ int exercise_lane_choice(const char* artifact) {
                   << resumed.reused_prompt_tokens << " expected=" << expected << '\n';
         return 1;
     }
+
+    // Steady state: both lanes now hold something, and the stale conversation on one of them is
+    // longer than the live one started next. A side request then loses retained prefix on either
+    // lane; ranking by value alone overwrote the live, shorter conversation. It must take the
+    // least recently admitted lane instead.
+    std::vector<ninfer::TokenId> live{248045, 846, 198};
+    for (int index = 0; index < 500; ++index) {
+        live.push_back(static_cast<ninfer::TokenId>(7000 + (index * 53) % 4000));
+    }
+    const ninfer::GenerationResult live_first =
+        engine.generate(engine.prepare_tokens(live), request);
+    const std::vector<ninfer::TokenId> second_side{248045, 846, 198, 9821, 248046, 198};
+    const ninfer::GenerationResult second_side_result =
+        engine.generate(engine.prepare_tokens(second_side), request);
+    if (live_first.generated_token_ids.size() != 5 ||
+        second_side_result.generated_token_ids.size() != 5) {
+        std::cerr << "lane-choice steady-state requests did not generate five tokens\n";
+        return 1;
+    }
+    std::vector<ninfer::TokenId> live_continuation = live;
+    live_continuation.insert(live_continuation.end(), live_first.generated_token_ids.begin(),
+                             live_first.generated_token_ids.end());
+    live_continuation.push_back(198);
+    const ninfer::GenerationResult live_resumed =
+        engine.generate(engine.prepare_tokens(live_continuation), request);
+    const std::uint32_t live_expected =
+        static_cast<std::uint32_t>(live.size() + live_first.generated_token_ids.size() - 1);
+    if (live_resumed.reused_prompt_tokens != live_expected) {
+        std::cerr << "side request evicted the live conversation instead of the stale lane: "
+                  << "reused=" << live_resumed.reused_prompt_tokens
+                  << " expected=" << live_expected << '\n';
+        return 1;
+    }
     return 0;
 }
 

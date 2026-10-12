@@ -705,6 +705,22 @@ private:
         return reuse - std::max<std::int64_t>(0, retained - reuse);
     }
 
+    // A lane the request continues or leaves intact (value >= 0) ranks by the prefill it saves.
+    // When every lane would lose more retained prefix than the request reuses, the request
+    // continues none of them: it then takes the least recently admitted lane. Ranking those by
+    // value alone overwrote the live conversation whenever a stale one on the other lane happened
+    // to be a few tokens longer, so a small side request still cost the next turn a full prefill.
+    [[nodiscard]] bool prefer_lane(std::uint32_t lane, std::int64_t value, std::uint32_t other,
+                                   std::int64_t other_value) const {
+        const bool keeps       = value >= 0;
+        const bool other_keeps = other_value >= 0;
+        if (keeps != other_keeps) { return keeps; }
+        if (keeps || lane_last_admission_[lane] == lane_last_admission_[other]) {
+            return value > other_value;
+        }
+        return lane_last_admission_[lane] < lane_last_admission_[other];
+    }
+
     [[nodiscard]] std::optional<LaneChoice>
     find_admission_lane(const std::shared_ptr<Request>& request) {
         std::optional<LaneChoice> selected;
@@ -715,7 +731,7 @@ private:
             const Plan& plan         = *request->lane_plans[lane];
             const std::int64_t value = lane_admission_value(lane, plan);
             if (instance_.program->can_admit_lane(lane, plan) &&
-                (!selected || value > selected_value)) {
+                (!selected || prefer_lane(lane, value, selected->lane, selected_value))) {
                 selected       = LaneChoice{.lane = lane};
                 selected_value = value;
             }
@@ -728,7 +744,7 @@ private:
             const Plan& plan         = *request->lane_plans[lane];
             const std::int64_t value = lane_admission_value(lane, plan);
             if (instance_.program->can_admit_lane_after_retained_eviction(lane, plan) &&
-                (!selected || value > selected_value)) {
+                (!selected || prefer_lane(lane, value, selected->lane, selected_value))) {
                 selected = LaneChoice{
                     .lane           = lane,
                     .evict_retained = true,
@@ -813,6 +829,7 @@ private:
             request->backfill_epoch         = backfill_epoch;
             request->backfill_class         = backfill_class;
             slots_[lane]                    = request;
+            lane_last_admission_[lane]      = ++admission_clock_;
             invalidate_lane_plans(lane);
 
             TransientRegion transient;
@@ -1175,6 +1192,8 @@ private:
     std::array<std::shared_ptr<Request>, kMaximumConcurrency> slots_{};
     std::optional<std::uint32_t> prefill_lane_;
     std::array<std::uint64_t, kMaximumConcurrency> lane_plan_versions_{};
+    std::array<std::uint64_t, kMaximumConcurrency> lane_last_admission_{};
+    std::uint64_t admission_clock_ = 0;
     std::optional<AdmissionProtection> protection_;
     std::uint64_t next_protection_epoch_ = 1;
     RuntimeStats cumulative_stats_;

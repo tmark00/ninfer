@@ -241,6 +241,11 @@ encode_items_overlay(DeviceContext& device, const LoadedModelData& model,
     }
 
     const auto window_start = OverlayClock::now();
+    // evict() unmaps the weight-pool tail immediately on the host, outside stream order, and the
+    // LM head is the first tail range it takes. Work enqueued just before the window may still
+    // read it -- the proposal-context row gather of this very request's prompt does -- so the
+    // device is quiesced before the pages go away.
+    CUDA_CHECK(cudaDeviceSynchronize());
     std::size_t mapped      = 0;
     std::byte* staging      = pool.evict(assets.layout.staging_bytes +
                                              staging_align(output_need) +

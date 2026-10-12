@@ -2,6 +2,7 @@
 #include "ops/op_tester.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -410,6 +411,99 @@ int remap_case(int token_count) {
     return failures;
 }
 
+// Independent oracle: FP64 dot products of the BF16 inputs, the smallest best row on ties, and a
+// strict comparison with the stored BF16 shortlist logit. Shortlist logits are placed a clear
+// margin above or below the best context score so the FP32 kernel and the FP64 oracle cannot
+// disagree on the comparison itself.
+int context_selection_case(int columns, int capacity, int count) {
+    constexpr int dim = 5120;
+    constexpr int n   = 1024;
+    std::vector<float> hidden(static_cast<std::size_t>(dim) * columns);
+    std::vector<float> rows(static_cast<std::size_t>(dim) * capacity);
+    std::uint32_t state = 0x9E3779B9u ^ static_cast<std::uint32_t>(columns * 131 + count);
+    const auto uniform  = [&]() {
+        state = state * 1664525u + 1013904223u;
+        return static_cast<float>((state >> 8) & 0xFFFFu) / 32768.0f - 1.0f;
+    };
+    for (float& value : hidden) { value = uniform(); }
+    for (float& value : rows) { value = 0.05f * uniform(); }
+    // Each column gets one decisively best row (score ~0.08*sum|h| ~ 200 against ~1 for the
+    // random rows), so the FP32 kernel and the FP64 oracle cannot rank context rows differently.
+    // Column 0 gets two bit-identical best rows, 5 and 9: the smaller one must win the tie.
+    const auto align_row = [&](int row, int column) {
+        for (int d = 0; d < dim; ++d) {
+            const float h = hidden[static_cast<std::size_t>(column) * dim + d];
+            rows[static_cast<std::size_t>(row) * dim + d] = h >= 0.0f ? 0.08f : -0.08f;
+        }
+    };
+    if (count > 10 + columns) {
+        align_row(5, 0);
+        align_row(9, 0);
+        for (int t = 1; t < columns; ++t) { align_row(10 + t, t); }
+    }
+    round_to_bf16(hidden);
+    round_to_bf16(rows);
+
+    std::vector<std::int32_t> id_map(n), context_ids(static_cast<std::size_t>(capacity));
+    for (int i = 0; i < n; ++i) { id_map[static_cast<std::size_t>(i)] = 3 * i + 1; }
+    for (int j = 0; j < capacity; ++j) { context_ids[static_cast<std::size_t>(j)] = 200000 + 7 * j; }
+    std::vector<std::int32_t> indices(static_cast<std::size_t>(columns)), expected(indices.size());
+    std::vector<float> logits(static_cast<std::size_t>(n) * columns, -30.0f);
+    for (int t = 0; t < columns; ++t) {
+        double best = -1e300;
+        int best_j  = -1;
+        for (int j = 0; j < count; ++j) {
+            double sum = 0.0;
+            for (int d = 0; d < dim; ++d) {
+                sum += static_cast<double>(rows[static_cast<std::size_t>(j) * dim + d]) *
+                       static_cast<double>(hidden[static_cast<std::size_t>(t) * dim + d]);
+            }
+            if (sum > best) { best = sum; best_j = j; }
+        }
+        const int index = (37 * t + 11) % n;
+        // Even columns: the context candidate wins; odd columns: the shortlist keeps its token.
+        const bool context_wins = best_j >= 0 && t % 2 == 0;
+        const double margin     = 0.25 * std::abs(best) + 1.0;
+        const double shortlist  = best_j < 0 ? 4.0 : (context_wins ? best - margin : best + margin);
+        logits[static_cast<std::size_t>(t) * n + index] = static_cast<float>(shortlist);
+        indices[static_cast<std::size_t>(t)]            = index;
+        expected[static_cast<std::size_t>(t)] =
+            context_wins ? context_ids[static_cast<std::size_t>(best_j)] : id_map[static_cast<std::size_t>(index)];
+    }
+    round_to_bf16(logits);
+
+    DeviceBuffer d_hidden  = to_device_bf16(hidden);
+    DeviceBuffer d_rows    = to_device_bf16(rows);
+    DeviceBuffer d_logits  = to_device_bf16(logits);
+    DeviceBuffer d_map     = to_device(id_map);
+    DeviceBuffer d_ids     = to_device(context_ids);
+    DeviceBuffer d_count   = to_device<std::int32_t>({count});
+    GuardedDeviceBuffer d_tokens(indices.size() * sizeof(std::int32_t));
+    initialize(d_tokens, indices);
+    DeviceBuffer d_work(ops::proposal_select_with_context_workspace_bytes(columns));
+
+    Tensor hidden_tensor(d_hidden.p, DType::BF16, {dim, columns});
+    Tensor logits_tensor(d_logits.p, DType::BF16, {n, columns});
+    Tensor token_tensor(d_tokens.data(), DType::I32, {columns});
+    Tensor rows_tensor(d_rows.p, DType::BF16, {dim, capacity});
+    Tensor ids_tensor(d_ids.p, DType::I32, {capacity});
+    Tensor count_tensor(d_count.p, DType::I32, {1});
+    Tensor work_tensor(d_work.p, DType::I32,
+                       {static_cast<std::int32_t>(ops::proposal_select_with_context_workspace_bytes(
+                            columns) / sizeof(std::int32_t))});
+    ops::proposal_select_with_context(hidden_tensor, logits_tensor, token_tensor,
+                                      static_cast<const std::int32_t*>(d_map.p), n, rows_tensor,
+                                      ids_tensor, count_tensor, work_tensor, nullptr);
+    cuda_synchronize();
+
+    const std::string label = "proposal context T=" + std::to_string(columns) +
+                              " C=" + std::to_string(capacity) + " k=" + std::to_string(count);
+    int failures = verify_exact((label + " tokens").c_str(),
+                                read<std::int32_t>(d_tokens, indices.size()), expected);
+    failures += d_tokens.verify_guards((label + " guards").c_str());
+    return failures;
+}
+
 } // namespace
 
 int main() {
@@ -447,6 +541,10 @@ int main() {
     failures += remap_case(1);
     failures += remap_case(15);
     failures += remap_case(120);
+    failures += context_selection_case(1, 64, 0);
+    failures += context_selection_case(2, 96, 37);
+    failures += context_selection_case(3, 96, 96);
+    failures += context_selection_case(8, 4096, 1500);
 
     if (failures != 0) {
         std::cerr << "speculative_round failures=" << failures << '\n';

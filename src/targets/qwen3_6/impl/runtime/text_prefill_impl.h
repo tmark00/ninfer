@@ -45,8 +45,10 @@ void configure_text_card(TextContext& card, const ExecutionCore& execution,
     card.set_mtp_proposal_extent(mtp_proposal_extent);
     if (execution.proposal_head == ProposalHead::Full) {
         card.set_proposal_head(nullptr, nullptr, 0);
+        card.set_proposal_context(nullptr);
         return;
     }
+    card.set_proposal_context(execution.proposal_context);
     if (card.proposal_head() == nullptr || card.proposal_head_ids() == nullptr ||
         card.proposal_head_n() <= 0) {
         throw std::runtime_error("optimized proposal head is unavailable");

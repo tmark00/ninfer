@@ -22,6 +22,7 @@
 #include <memory>
 #include <optional>
 #include <span>
+#include <unordered_map>
 #include <vector>
 
 namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS {
@@ -297,6 +298,18 @@ public:
     Tensor tail_hidden_store;
     Tensor rewrite_checkpoint_hidden_store;
 
+    // Context extension of the optimized proposal head (--draft-context-tokens). The device view
+    // holds candidate output-head rows; the host side keeps which shortlist tokens the head
+    // already covers and a ring of candidate tokens shared by all lanes, newest overwriting
+    // oldest. Candidates only widen MTP proposals; verification is unchanged.
+    std::optional<schedule::ProposalContextView> proposal_context;
+    std::vector<std::uint8_t> proposal_shortlisted;
+    std::vector<TokenId> proposal_context_ring;
+    std::vector<std::uint8_t> proposal_context_dirty;
+    std::unordered_map<TokenId, std::uint32_t> proposal_context_slots;
+    std::uint32_t proposal_context_next = 0;
+    std::uint32_t proposal_context_size = 0;
+
     std::array<SequenceState, kMaximumConcurrency> sequences;
     std::array<RequestControl, kMaximumConcurrency> requests;
 
@@ -324,6 +337,7 @@ public:
     std::size_t workspace_logical_peak_bytes = 0;
 
 private:
+    void observe_proposal_context(std::span<const TokenId> tokens);
     void clear_lane(SequenceState& sequence, RequestControl& request) noexcept;
     void ordered_reset(SequenceState& sequence);
     void prepare_graphs();

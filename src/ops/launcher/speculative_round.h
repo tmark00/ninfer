@@ -29,4 +29,10 @@ void speculative_select_accepted_hidden_launch(const Tensor& hidden, const Tenso
 void proposal_remap_token_ids_launch(Tensor& proposal_tokens, const std::int32_t* id_map,
                                      std::int32_t n, cudaStream_t stream);
 
+void proposal_select_with_context_launch(const Tensor& hidden, const Tensor& shortlist_logits,
+                                         Tensor& proposal_tokens, const std::int32_t* id_map,
+                                         std::int32_t n, const Tensor& context_rows,
+                                         const Tensor& context_ids, const Tensor& context_count,
+                                         Tensor& workspace, cudaStream_t stream);
+
 } // namespace ninfer::ops::detail

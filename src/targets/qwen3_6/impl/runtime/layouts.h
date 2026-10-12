@@ -35,6 +35,16 @@ struct DFlashPersistentLayout {
     }
 };
 
+// Context extension of the optimized proposal head: candidate output-head rows gathered at run
+// time, their token ids, the live candidate count read by captured graphs, and the per-column
+// selection scratch of ops::proposal_select_with_context.
+struct ProposalContextLayout {
+    TensorLayout rows;
+    TensorLayout ids;
+    TensorLayout count;
+    TensorLayout scratch;
+};
+
 struct PersistentLayout {
     qwen3_6::DecoderStateLayout decoder;
     std::array<std::optional<GdnReplayRecordLayout>, qwen3_6::kMtpDecodeMaximumDrafts>
@@ -47,6 +57,7 @@ struct PersistentLayout {
     TensorLayout sampling_config;
     TensorLayout tail_hidden;
     TensorLayout rewrite_checkpoint_hidden;
+    std::optional<ProposalContextLayout> proposal_context;
     std::size_t bytes            = 0;
     std::size_t kv_payload_bytes = 0;
 };
@@ -79,6 +90,7 @@ struct SequencePlanningInputs {
     bool kv_e8_root                        = false;
     ProposalHead proposal_head             = ProposalHead::Full;
     MtpDraftPolicy mtp_policy              = MtpDraftPolicy::Fixed;
+    std::uint32_t context_proposal_tokens  = 0;
     StartupFeatures features;
     std::uint32_t vision_max_merged = 32768;
     bool use_cuda_graph = true;
@@ -109,6 +121,7 @@ struct SequencePlanImpl<NINFER_QWEN36_VARIANT> {
     bool kv_e8_root                        = false;
     ProposalHead proposal_head             = ProposalHead::Full;
     MtpDraftPolicy mtp_policy              = MtpDraftPolicy::Fixed;
+    std::uint32_t context_proposal_tokens  = 0;
     StartupFeatures features;
     std::uint32_t vision_max_merged = 32768;
     bool use_cuda_graph = true;

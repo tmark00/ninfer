@@ -5,6 +5,7 @@
 #include "ninfer/ops/gdn_replay.h"
 #include "ninfer/ops/prepare_ragged_prefix.h"
 #include "ninfer/ops/scatter.h"
+#include "ninfer/ops/embedding.h"
 #include "ninfer/ops/speculative_round.h"
 
 #include <cuda_runtime.h>
@@ -280,6 +281,30 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
     sampling_config                 = plan.persistent.sampling_config.bind(backing);
     tail_hidden_store               = plan.persistent.tail_hidden.bind(backing);
     rewrite_checkpoint_hidden_store = plan.persistent.rewrite_checkpoint_hidden.bind(backing);
+    if (plan.persistent.proposal_context) {
+        if (!model.optimized_proposal) {
+            throw std::logic_error("context proposal tokens require the optimized proposal head");
+        }
+        const auto& layout = *plan.persistent.proposal_context;
+        proposal_context   = schedule::ProposalContextView{layout.rows.bind(backing), layout.ids.bind(backing),
+                                                 layout.count.bind(backing),
+                                                 layout.scratch.bind(backing)};
+        const Tensor& shortlist = model.optimized_proposal->token_ids;
+        std::vector<std::int32_t> shortlist_ids(static_cast<std::size_t>(shortlist.numel()));
+        CUDA_CHECK(cudaMemcpy(shortlist_ids.data(), shortlist.data,
+                              shortlist_ids.size() * sizeof(std::int32_t), cudaMemcpyDeviceToHost));
+        proposal_shortlisted.assign(static_cast<std::size_t>(TextConfig::output_rows), 0);
+        for (const std::int32_t token : shortlist_ids) {
+            if (token >= 0 && token < TextConfig::output_rows) {
+                proposal_shortlisted[static_cast<std::size_t>(token)] = 1;
+            }
+        }
+        const auto columns = static_cast<std::size_t>(proposal_context->ids.ne[0]);
+        proposal_context_ring.assign(columns, -1);
+        proposal_context_dirty.assign(columns, 0);
+        proposal_context_slots.reserve(columns);
+        set_device_i32(proposal_context->count, 0);
+    }
     for (std::uint32_t lane = 0; lane < max_concurrency; ++lane) {
         SequenceState& sequence = sequences[lane];
         sequence.lane           = lane;
@@ -639,6 +664,7 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
         sequence.tail_hidden_valid = base == prompt_tokens && sequence.tail_hidden_valid;
         sequence.ledger.assign(prompt.token_ids.begin(), prompt.token_ids.end());
         sequence.prefix_identity.assign(prompt);
+        observe_proposal_context(sequence.ledger);
 
         if (speculative_backend == SpeculativeBackend::DFlash) {
             if (!dflash || !io.dflash_decode || !sequence.kv->backend) {
@@ -915,6 +941,7 @@ void ProgramImplCore::resolve_pending_batch(std::span<const std::uint32_t> lanes
                     ? mtp_host_egress->licensed_tokens.data() + row * width
                     : dflash_host_egress->licensed_tokens.data() + row * width;
             sequence.ledger.insert(sequence.ledger.end(), token_base, token_base + committed);
+            observe_proposal_context(std::span<const TokenId>(token_base, committed));
             sequence.prefix_identity.append_generated(committed, sequence.rope_delta);
             sequence.execution_frontier = pending.base_E + committed;
             sequence.ledger_frontier    = pending.base_S + committed;
@@ -1160,6 +1187,55 @@ qwen3_6::PagedKVCacheView ProgramImplCore::mtp_kv_view(const SequenceState& sequ
     return decoder->mtp_cache()->execution_view(*sequence.kv->backend);
 }
 
+// Adds the tokens of a prompt or of committed output that the proposal shortlist does not cover
+// to the shared candidate ring, gathers their output-head rows on the device stream and publishes
+// the live count. Captured graphs read rows, ids and count through fixed addresses, so the next
+// replay already sees the update.
+void ProgramImplCore::observe_proposal_context(std::span<const TokenId> tokens) {
+    if (!proposal_context) { return; }
+    const auto capacity = static_cast<std::uint32_t>(proposal_context_ring.size());
+    bool changed        = false;
+    for (const TokenId token : tokens) {
+        if (token < 0 || token >= TextConfig::token_domain ||
+            proposal_shortlisted[static_cast<std::size_t>(token)] != 0 ||
+            proposal_context_slots.contains(token)) {
+            continue;
+        }
+        const std::uint32_t slot = proposal_context_next;
+        if (const TokenId evicted = proposal_context_ring[slot]; evicted >= 0) {
+            proposal_context_slots.erase(evicted);
+        }
+        proposal_context_ring[slot]  = token;
+        proposal_context_dirty[slot] = 1;
+        proposal_context_slots.emplace(token, slot);
+        proposal_context_next = slot + 1 == capacity ? 0 : slot + 1;
+        proposal_context_size = std::min(proposal_context_size + 1, capacity);
+        changed               = true;
+    }
+    if (!changed) { return; }
+    for (std::uint32_t begin = 0; begin < capacity;) {
+        if (proposal_context_dirty[begin] == 0) {
+            ++begin;
+            continue;
+        }
+        std::uint32_t end = begin;
+        while (end < capacity && proposal_context_dirty[end] != 0) {
+            proposal_context_dirty[end] = 0;
+            ++end;
+        }
+        const auto first = static_cast<std::int32_t>(begin);
+        const auto count = static_cast<std::int32_t>(end - begin);
+        Tensor ids       = proposal_context->ids.slice(0, first, count);
+        Tensor rows      = proposal_context->rows.slice(1, first, count);
+        CUDA_CHECK(cudaMemcpyAsync(ids.data, proposal_context_ring.data() + begin,
+                                   static_cast<std::size_t>(count) * sizeof(TokenId),
+                                   cudaMemcpyHostToDevice, device.stream));
+        ops::embedding(ids, model.output_head, rows, device.stream);
+        begin = end;
+    }
+    set_device_i32(proposal_context->count, static_cast<std::int32_t>(proposal_context_size));
+}
+
 void ProgramImplCore::set_device_i32(Tensor& tensor, std::int32_t value) {
     CUDA_CHECK(
         cudaMemcpyAsync(tensor.data, &value, sizeof(value), cudaMemcpyHostToDevice, device.stream));
@@ -1364,7 +1440,7 @@ void ProgramImplCore::prepare_graphs() {
                                        io,
                                        prefill_hidden,
                                        prefill_chunk,
-                                       proposal_head};
+                                       proposal_head, proposal_context ? &*proposal_context : nullptr};
     };
 
     if (speculative_backend == SpeculativeBackend::None) {
@@ -1658,7 +1734,7 @@ void ProgramImplCore::enqueue_dflash_context_append(std::span<const std::uint32_
 
     schedule::DFlashAppendContext state{{device, model, work, decoder->linear_attention,
                                          replay_records ? &*replay_records : nullptr, io,
-                                         prefill_hidden, prefill_chunk, proposal_head},
+                                         prefill_hidden, prefill_chunk, proposal_head, proposal_context ? &*proposal_context : nullptr},
                                         *dflash};
     mark_workspace_usage(workspace_plan.dflash_context);
     schedule::dflash_append_context(state, features, positions, device_counts, lane_tensor,
@@ -1689,7 +1765,7 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
         schedule::PrefillContext schedule_state{
             {device, model, work, decoder->linear_attention,
              replay_records ? &*replay_records : nullptr, io, prefill_hidden, prefill_chunk,
-             proposal_head},
+             proposal_head, proposal_context ? &*proposal_context : nullptr},
             text_kv_view(sequence),
             mtp_kv_view(sequence),
             decoder->text_kv,
@@ -1831,6 +1907,7 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
             throw std::logic_error("candidate token ledger does not match prompt length");
         }
         sequence.ledger.push_back(host_tokens[0]);
+        observe_proposal_context(std::span<const TokenId>(host_tokens, 1));
         sequence.prefix_identity.append_generated(1, sequence.rope_delta);
         sequence.text_kv_valid = prompt_tokens;
         if (staged.prepare_mtp) {
@@ -1958,7 +2035,7 @@ ProgramImplCore::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
         schedule::OrdinaryBatchContext schedule_state{
             {device, model, work, decoder->linear_attention,
              replay_records ? &*replay_records : nullptr, io, prefill_hidden, prefill_chunk,
-             proposal_head},
+             proposal_head, proposal_context ? &*proposal_context : nullptr},
             decoder->text_kv,
             *io.ordinary,
             *ordinary_host_ingress,
@@ -2122,7 +2199,7 @@ ProgramImplCore::decode_mtp_batch(std::span<const std::uint32_t> lanes,
 
         schedule::MtpBatchContext schedule_state{{device, model, work, decoder->linear_attention,
                                                   &records, io, prefill_hidden, prefill_chunk,
-                                                  proposal_head},
+                                                  proposal_head, proposal_context ? &*proposal_context : nullptr},
                                                  decoder->text_kv,
                                                  *decoder->mtp_cache(),
                                                  frame,
@@ -2305,7 +2382,7 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
         schedule::DFlashBatchContext schedule_state{{device, model, work, decoder->linear_attention,
                                                      replay_records ? &*replay_records : nullptr,
                                                      io, prefill_hidden, prefill_chunk,
-                                                     proposal_head},
+                                                     proposal_head, proposal_context ? &*proposal_context : nullptr},
                                                     decoder->text_kv,
                                                     *dflash,
                                                     *io.dflash_decode,

@@ -97,6 +97,11 @@ struct SpeculativeOptions {
     std::uint32_t draft_tokens = 0;
     ProposalHead proposal_head = ProposalHead::Full;
     MtpDraftPolicy mtp_policy  = MtpDraftPolicy::Fixed;
+    // Capacity of the context extension of the optimized proposal head: tokens that occur in a
+    // prompt or an output but lie outside the head's frequency shortlist become extra MTP draft
+    // candidates, scored against their output-head rows. 0 disables it. Requires MTP and
+    // ProposalHead::Optimized; verification is unchanged, so only acceptance can change.
+    std::uint32_t context_proposal_tokens = 0;
 };
 
 struct LoadProgress {

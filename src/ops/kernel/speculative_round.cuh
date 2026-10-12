@@ -448,4 +448,97 @@ __global__ void proposal_remap_token_ids_kernel(std::int32_t* proposal_tokens,
     if (idx >= 0 && idx < n) { proposal_tokens[i] = id_map[idx]; }
 }
 
+// Context-extended proposal selection. A column's best context candidate travels as one 64-bit
+// word: the score as an order-preserving unsigned key in the high half and the complemented row
+// index in the low half, so a single atomicMax keeps the highest score and, on a tie, the smallest
+// row. Zero is below every key the score encoding produces, so it marks "no candidate".
+__device__ __forceinline__ unsigned int proposal_context_score_key(float value) {
+    const unsigned int bits = __float_as_uint(value);
+    return (bits & 0x80000000u) != 0 ? ~bits : (bits | 0x80000000u);
+}
+
+__device__ __forceinline__ float proposal_context_score_value(unsigned int key) {
+    return __uint_as_float((key & 0x80000000u) != 0 ? (key & 0x7FFFFFFFu) : ~key);
+}
+
+__global__ void proposal_context_reset_kernel(unsigned long long* best, std::int32_t columns) {
+    const int t = blockIdx.x * blockDim.x + threadIdx.x;
+    if (t < columns) { best[t] = 0ULL; }
+}
+
+template <int kWarps>
+__global__ void __launch_bounds__(kWarps * 32)
+    proposal_context_score_kernel(const __nv_bfloat16* __restrict__ hidden,
+                                  const __nv_bfloat16* __restrict__ rows,
+                                  const std::int32_t* __restrict__ count_ptr, std::int32_t dim,
+                                  unsigned long long* __restrict__ best) {
+    extern __shared__ __align__(16) unsigned char proposal_context_smem[];
+    auto* column = reinterpret_cast<__nv_bfloat16*>(proposal_context_smem);
+    const int count = *count_ptr;
+    const int first = static_cast<int>(blockIdx.x) * kWarps;
+    if (first >= count) { return; }
+    const int t = static_cast<int>(blockIdx.y);
+
+    const auto* source = reinterpret_cast<const uint4*>(hidden + static_cast<std::int64_t>(t) * dim);
+    auto* staged       = reinterpret_cast<uint4*>(column);
+    const int vectors  = dim / 8;
+    for (int v = static_cast<int>(threadIdx.x); v < vectors; v += kWarps * 32) { staged[v] = source[v]; }
+    __syncthreads();
+
+    const int warp = static_cast<int>(threadIdx.x) / 32;
+    const int lane = static_cast<int>(threadIdx.x) % 32;
+    const int row  = first + warp;
+    if (row >= count) { return; }
+    const auto* weights =
+        reinterpret_cast<const uint4*>(rows + static_cast<std::int64_t>(row) * dim);
+    float sum = 0.0f;
+    for (int v = lane; v < vectors; v += 32) {
+        const uint4 w = weights[v];
+        const uint4 h = staged[v];
+        const auto* wp = reinterpret_cast<const __nv_bfloat162*>(&w);
+        const auto* hp = reinterpret_cast<const __nv_bfloat162*>(&h);
+#pragma unroll
+        for (int k = 0; k < 4; ++k) {
+            const float2 wf = __bfloat1622float2(wp[k]);
+            const float2 hf = __bfloat1622float2(hp[k]);
+            sum = fmaf(wf.x, hf.x, sum);
+            sum = fmaf(wf.y, hf.y, sum);
+        }
+    }
+#pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        sum += __shfl_xor_sync(0xFFFFFFFFu, sum, offset);
+    }
+    if (lane == 0) {
+        const unsigned long long word =
+            (static_cast<unsigned long long>(proposal_context_score_key(sum)) << 32) |
+            static_cast<unsigned long long>(0xFFFFFFFFu - static_cast<unsigned int>(row));
+        atomicMax(best + t, word);
+    }
+}
+
+__global__ void proposal_context_finalize_kernel(std::int32_t* proposal_tokens, std::int32_t columns,
+                                                 const __nv_bfloat16* __restrict__ shortlist_logits,
+                                                 const std::int32_t* __restrict__ id_map,
+                                                 std::int32_t n,
+                                                 const std::int32_t* __restrict__ context_ids,
+                                                 const unsigned long long* __restrict__ best) {
+    const int t = blockIdx.x * blockDim.x + threadIdx.x;
+    if (t >= columns) { return; }
+    const int idx = proposal_tokens[t];
+    if (idx < 0 || idx >= n) { return; }
+    std::int32_t token             = id_map[idx];
+    const unsigned long long word  = best[t];
+    if (word != 0ULL) {
+        const float context = proposal_context_score_value(static_cast<unsigned int>(word >> 32));
+        const float shortlist =
+            __bfloat162float(shortlist_logits[static_cast<std::int64_t>(t) * n + idx]);
+        if (context > shortlist) {
+            const auto row = static_cast<int>(0xFFFFFFFFu - static_cast<unsigned int>(word));
+            token          = context_ids[row];
+        }
+    }
+    proposal_tokens[t] = token;
+}
+
 } // namespace ninfer::ops

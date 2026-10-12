@@ -125,6 +125,14 @@ proposal head and requires a selected backend:
   --lm-head-draft
 ```
 
+The optimized proposal head scores a fixed frequency shortlist of 131,072 tokens chosen at
+conversion time. `--draft-context-tokens N` (MTP with `--lm-head-draft` only, at most 65,536)
+extends it at run time: tokens that occur in a prompt or an output but lie outside the shortlist
+become additional draft candidates, scored against their output-head rows, in one ring of `N`
+entries shared by all requests (newest overwrites oldest). Verification is unchanged, so greedy
+output is identical; only acceptance changes. It helps text the shortlist covers poorly, such as
+Polish prose or drug names, and costs `N * 10 KiB` of device memory (40 MiB at 4096).
+
 Add `--adaptive-mtp` to treat `--draft-tokens` as a maximum instead of a fixed verification
 window. The Engine estimates accepted-prefix survival at each draft position with fast and slow
 online filters, scores the predicted output against the measured target-GPU relative-width cost
@@ -171,6 +179,7 @@ measured recommendation rather than a semantic limit.
 | `--spec mtp\|dflash` | speculative backend | off |
 | `--draft-tokens N` | 27B MTP `1..8`; 35B-A3B MTP `1..5`; DFlash `1..15` | unset |
 | `--lm-head-draft` | optimized proposal head | off |
+| `--draft-context-tokens N` | run-time context candidates for the optimized proposal head | 0 (off) |
 | `--adaptive-mtp` | dynamically select MTP verification width up to `--draft-tokens` | off |
 | `--vision` | enable image/video input and load Vision GPU allocations | off |
 | `--vision-max-merged N` | per-item merged vision-token budget (`[64, 32768]`): oversized images/videos are downscaled at preprocessing to fit, never rejected; also bounds the vision share of the startup workspace/transient reservations, so smaller values return memory to KV | `32768` |

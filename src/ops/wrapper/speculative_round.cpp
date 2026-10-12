@@ -2,6 +2,8 @@
 #include "ops/launcher/speculative_round.h"
 
 #include <algorithm>
+#include <cstddef>
+#include <cstdint>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -177,6 +179,55 @@ void proposal_remap_token_ids(Tensor& proposal_tokens, const std::int32_t* id_ma
         throw std::invalid_argument("proposal_remap_token_ids: id_map must be non-null and n>0");
     }
     detail::proposal_remap_token_ids_launch(proposal_tokens, id_map, n, stream);
+}
+
+std::size_t proposal_select_with_context_workspace_bytes(std::int32_t columns) {
+    if (columns <= 0) {
+        throw std::invalid_argument("proposal_select_with_context: columns must be positive");
+    }
+    return static_cast<std::size_t>(columns) * sizeof(unsigned long long);
+}
+
+void proposal_select_with_context(const Tensor& hidden, const Tensor& shortlist_logits,
+                                  Tensor& proposal_tokens, const std::int32_t* id_map,
+                                  std::int32_t n, const Tensor& context_rows,
+                                  const Tensor& context_ids, const Tensor& context_count,
+                                  Tensor& workspace, cudaStream_t stream) {
+    constexpr const char* op = "proposal_select_with_context";
+    require_dtype(hidden, DType::BF16, op, "hidden");
+    const std::int32_t dim     = hidden.ne[0];
+    const std::int32_t columns = hidden.ne[1];
+    if (dim <= 0 || dim % 8 != 0 || columns <= 0 || hidden.ne[2] != 1 || hidden.ne[3] != 1) {
+        throw std::invalid_argument(
+            "proposal_select_with_context: hidden must be [D,T] with D a positive multiple of 8");
+    }
+    if (id_map == nullptr || n <= 0) {
+        throw std::invalid_argument(
+            "proposal_select_with_context: id_map must be non-null and n>0");
+    }
+    require_dtype(shortlist_logits, DType::BF16, op, "shortlist_logits");
+    if (shortlist_logits.ne[0] != n || shortlist_logits.ne[1] != columns ||
+        shortlist_logits.ne[2] != 1 || shortlist_logits.ne[3] != 1) {
+        throw std::invalid_argument("proposal_select_with_context: shortlist_logits must be [n,T]");
+    }
+    require_vector(proposal_tokens, DType::I32, columns, op, "proposal_tokens");
+    require_dtype(context_rows, DType::BF16, op, "context_rows");
+    const std::int32_t capacity = context_rows.ne[1];
+    if (context_rows.ne[0] != dim || capacity <= 0 || context_rows.ne[2] != 1 ||
+        context_rows.ne[3] != 1) {
+        throw std::invalid_argument("proposal_select_with_context: context_rows must be [D,C]");
+    }
+    require_vector(context_ids, DType::I32, capacity, op, "context_ids");
+    require_scalar(context_count, DType::I32, op, "context_count");
+    require_contiguous_nonnull(workspace, op, "workspace");
+    if (workspace.bytes() < proposal_select_with_context_workspace_bytes(columns) ||
+        reinterpret_cast<std::uintptr_t>(workspace.data) % alignof(unsigned long long) != 0) {
+        throw std::invalid_argument(
+            "proposal_select_with_context: workspace is too small or misaligned");
+    }
+    detail::proposal_select_with_context_launch(hidden, shortlist_logits, proposal_tokens, id_map,
+                                                n, context_rows, context_ids, context_count,
+                                                workspace, stream);
 }
 
 } // namespace ninfer::ops

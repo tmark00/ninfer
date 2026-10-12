@@ -496,6 +496,7 @@ curl http://127.0.0.1:8080/v1/models \
 | `--spec mtp\|dflash` | speculative backend | off |
 | `--draft-tokens N` | 27B MTP `1..8`; 35B-A3B MTP `1..5`; DFlash `1..15` | unset |
 | `--lm-head-draft` | optimized proposal head | off |
+| `--draft-context-tokens N` | run-time context candidates for the optimized proposal head (MTP); see the CLI guide | 0 (off) |
 | `--adaptive-mtp` | dynamically select MTP verification width up to `--draft-tokens` | off |
 | `--default-max-tokens N` | output limit when omitted by a request | `8192` |
 | `--vision` | enable media input and load Vision GPU allocations | off |

@@ -5,6 +5,7 @@
 
 #include <cuda_runtime.h>
 
+#include <cstddef>
 #include <cstdint>
 
 namespace ninfer::ops {
@@ -120,5 +121,38 @@ void speculative_select_accepted_hidden(const Tensor& hidden, const Tensor& sele
  */
 void proposal_remap_token_ids(Tensor& proposal_tokens, const std::int32_t* id_map,
                               std::int32_t count, cudaStream_t stream);
+
+/**
+ * Op: proposal_select_with_context
+ *
+ * Math / indexing, for every proposal column t with i_t = proposal_tokens[t] and k = *context_count:
+ *   s_t   = float(shortlist_logits[i_t,t])
+ *   c_j,t = sum_d float(context_rows[d,j]) * float(hidden[d,t])      for j in [0,k)
+ *   j*_t  = the smallest j attaining max_j c_j,t
+ *   proposal_tokens[t]' = context_ids[j*_t]   if k > 0 and c_{j*_t},t > s_t
+ *                       = id_map[i_t]          otherwise.
+ *
+ * It replaces proposal_remap_token_ids for a shortlist proposal head extended at run time by
+ * context rows: the shortlist argmax index is remapped to a token id unless a context row scores
+ * strictly higher. The proposal only feeds speculative verification, so the comparison is an
+ * implementation profile, not a semantic boundary: c is accumulated in FP32 and compared with the
+ * BF16 shortlist logit as stored.
+ *
+ * Shape / numeric / effects:
+ *   hidden is contiguous BF16 [D,T] with D a multiple of 8; shortlist_logits is contiguous BF16
+ *   [count,T]; proposal_tokens is contiguous I32 [T] holding shortlist indices in [0,count) and is
+ *   updated in place; id_map is a distinct device I32 array [count]. context_rows is contiguous
+ *   BF16 [D,C] (column j holds context candidate j), context_ids is contiguous I32 [C], and
+ *   context_count is a device I32 scalar in [0,C], read on the device so a captured CUDA Graph
+ *   follows later updates. workspace holds at least
+ *   proposal_select_with_context_workspace_bytes(T) bytes, 8-byte aligned; its contents are
+ *   overwritten. No other state is written.
+ */
+[[nodiscard]] std::size_t proposal_select_with_context_workspace_bytes(std::int32_t columns);
+void proposal_select_with_context(const Tensor& hidden, const Tensor& shortlist_logits,
+                                  Tensor& proposal_tokens, const std::int32_t* id_map,
+                                  std::int32_t count, const Tensor& context_rows,
+                                  const Tensor& context_ids, const Tensor& context_count,
+                                  Tensor& workspace, cudaStream_t stream);
 
 } // namespace ninfer::ops

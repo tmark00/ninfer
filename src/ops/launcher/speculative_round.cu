@@ -122,4 +122,35 @@ void proposal_remap_token_ids_launch(Tensor& proposal_tokens, const std::int32_t
     CUDA_CHECK(cudaGetLastError());
 }
 
+void proposal_select_with_context_launch(const Tensor& hidden, const Tensor& shortlist_logits,
+                                         Tensor& proposal_tokens, const std::int32_t* id_map,
+                                         std::int32_t n, const Tensor& context_rows,
+                                         const Tensor& context_ids, const Tensor& context_count,
+                                         Tensor& workspace, cudaStream_t stream) {
+    constexpr int kWarps        = 8;
+    constexpr int kSmallBlock   = 64;
+    const std::int32_t dim      = hidden.ne[0];
+    const std::int32_t columns  = hidden.ne[1];
+    const std::int32_t capacity = context_rows.ne[1];
+    auto* best                  = static_cast<unsigned long long*>(workspace.data);
+
+    proposal_context_reset_kernel<<<std::max(1, div_up(columns, kSmallBlock)), kSmallBlock, 0,
+                                    stream>>>(best, columns);
+    CUDA_CHECK(cudaGetLastError());
+    const dim3 grid(static_cast<unsigned int>(std::max(1, div_up(capacity, kWarps))),
+                    static_cast<unsigned int>(columns));
+    const std::size_t smem = static_cast<std::size_t>(dim) * sizeof(__nv_bfloat16);
+    proposal_context_score_kernel<kWarps><<<grid, kWarps * 32, smem, stream>>>(
+        static_cast<const __nv_bfloat16*>(hidden.data),
+        static_cast<const __nv_bfloat16*>(context_rows.data),
+        static_cast<const std::int32_t*>(context_count.data), dim, best);
+    CUDA_CHECK(cudaGetLastError());
+    proposal_context_finalize_kernel<<<std::max(1, div_up(columns, kSmallBlock)), kSmallBlock, 0,
+                                       stream>>>(
+        static_cast<std::int32_t*>(proposal_tokens.data), columns,
+        static_cast<const __nv_bfloat16*>(shortlist_logits.data), id_map, n,
+        static_cast<const std::int32_t*>(context_ids.data), best);
+    CUDA_CHECK(cudaGetLastError());
+}
+
 } // namespace ninfer::ops::detail

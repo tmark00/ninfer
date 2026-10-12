@@ -557,8 +557,16 @@ void TextContext::proposal_argmax(const Tensor& hidden, Tensor& logits, Tensor& 
         Tensor proposal_logits = work_.alloc(DType::BF16, {proposal_head_n_, T});
         ops::linear(hidden, *proposal_head_, proposal_logits, ctx_.stream);
         ops::argmax(proposal_logits, proposal_tokens, proposal_head_n_, ctx_.stream);
-        ops::proposal_remap_token_ids(proposal_tokens, proposal_head_ids_, proposal_head_n_,
-                                      ctx_.stream);
+        if (proposal_context_ != nullptr) {
+            Tensor scratch = proposal_context_->scratch;
+            ops::proposal_select_with_context(hidden, proposal_logits, proposal_tokens,
+                                              proposal_head_ids_, proposal_head_n_,
+                                              proposal_context_->rows, proposal_context_->ids,
+                                              proposal_context_->count, scratch, ctx_.stream);
+        } else {
+            ops::proposal_remap_token_ids(proposal_tokens, proposal_head_ids_, proposal_head_n_,
+                                          ctx_.stream);
+        }
     } else {
         Tensor output_logits = matrix_window(logits, T);
         ops::linear(hidden, *lm_head_, output_logits, ctx_.stream);

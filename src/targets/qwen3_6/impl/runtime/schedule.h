@@ -39,6 +39,7 @@ struct ExecutionCore {
     Tensor& prefill_hidden;
     std::uint32_t prefill_chunk;
     ProposalHead proposal_head;
+    const ProposalContextView* proposal_context = nullptr;
 };
 
 struct PrefillContext {

@@ -149,6 +149,15 @@ struct DFlashFeatureSink {
 
 class VisionPrefillSession;
 
+// Persistent context extension of the optimized proposal head (Program owns the storage and the
+// host-side candidate set; see ProposalContextLayout).
+struct ProposalContextView {
+    Tensor rows;
+    Tensor ids;
+    Tensor count;
+    Tensor scratch;
+};
+
 class TextContext {
 public:
     TextContext(DeviceContext& ctx, const LoadedModelData& weights, WorkspaceArena& work,
@@ -167,6 +176,10 @@ public:
         proposal_head_     = weight;
         proposal_head_ids_ = ids;
         proposal_head_n_   = count;
+    }
+
+    void set_proposal_context(const ProposalContextView* context) noexcept {
+        proposal_context_ = context;
     }
 
     void set_sampling(const ops::SamplingConfig* config) noexcept { sampling_config_ = config; }
@@ -318,6 +331,7 @@ private:
     const Weight* proposal_head_                = nullptr;
     const std::int32_t* proposal_head_ids_      = nullptr;
     int proposal_head_n_                        = 0;
+    const ProposalContextView* proposal_context_ = nullptr;
     const ops::SamplingConfig* sampling_config_ = nullptr;
     MtpW mtp_;
     std::array<FullLayerW, TextConfig::full_attention_layers()> full_{};

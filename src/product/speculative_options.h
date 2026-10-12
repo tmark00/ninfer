@@ -27,6 +27,13 @@ namespace ninfer::product {
 }
 
 inline void validate_speculative_cli_options(const SpeculativeOptions& options) {
+    if (options.context_proposal_tokens != 0 &&
+        (options.backend != SpeculativeBackend::Mtp ||
+         options.proposal_head != ProposalHead::Optimized ||
+         options.context_proposal_tokens > 65536)) {
+        throw std::invalid_argument(
+            "--draft-context-tokens requires --spec mtp with --lm-head-draft and at most 65536");
+    }
     switch (options.backend) {
     case SpeculativeBackend::None:
         if (options.draft_tokens != 0 || options.proposal_head != ProposalHead::Full ||

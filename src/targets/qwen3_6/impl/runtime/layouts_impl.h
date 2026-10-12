@@ -244,6 +244,20 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
         {TextConfig::hidden, static_cast<std::int32_t>(LinearStateSlots::kRewriteCheckpoints *
                                                        plan.max_concurrency)},
         "rewrite checkpoint hidden");
+    if (plan.context_proposal_tokens != 0) {
+        const auto columns = static_cast<std::int32_t>(plan.context_proposal_tokens);
+        ProposalContextLayout context;
+        context.rows  = add_tensor(builder, DType::BF16, {TextConfig::hidden, columns},
+                                   "proposal context rows");
+        context.ids   = add_tensor(builder, DType::I32, {columns}, "proposal context ids");
+        context.count = add_tensor(builder, DType::I32, {1}, "proposal context count");
+        // Two I32 words per selection column hold its 64-bit best-candidate word; proposal
+        // selection runs over at most one column per concurrent request.
+        context.scratch = add_tensor(
+            builder, DType::I32, {static_cast<std::int32_t>(2 * kMaximumConcurrency)},
+            "proposal context scratch");
+        out.proposal_context = context;
+    }
     out.bytes = builder.finish(kArenaAlign, "persistent layout");
     out.kv_payload_bytes =
         out.decoder.kv_payload_bytes() + (out.dflash ? out.dflash->kv_payload_bytes() : 0);
@@ -602,6 +616,13 @@ void validate_target_options(DeviceContext& device, const EngineOptions& options
     default:
         throw std::invalid_argument("unknown kv_capacity policy");
     }
+    if (options.speculative.context_proposal_tokens != 0 &&
+        (options.speculative.backend != SpeculativeBackend::Mtp ||
+         options.speculative.proposal_head != ProposalHead::Optimized ||
+         options.speculative.context_proposal_tokens > 65536)) {
+        throw std::invalid_argument(
+            "context proposal tokens require MTP, the optimized proposal head and at most 65536");
+    }
     switch (options.speculative.backend) {
     case SpeculativeBackend::None:
         if (options.speculative.draft_tokens != 0 ||
@@ -661,6 +682,7 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
     impl->speculative_backend = inputs.speculative_backend;
     impl->proposal_head       = inputs.proposal_head;
     impl->mtp_policy          = inputs.mtp_policy;
+    impl->context_proposal_tokens = inputs.context_proposal_tokens;
     impl->features            = inputs.features;
     impl->kv_packed_v         = inputs.kv_packed_v;
     impl->kv_rotate_k         = inputs.kv_rotate_k;
@@ -781,6 +803,7 @@ make_sequence_planner_impl(DeviceContext& device, const EngineOptions& options,
         .kv_e8_root    = options.kv_cache == KvCacheStorage::RK2V4E8,
         .proposal_head  = options.speculative.proposal_head,
         .mtp_policy     = options.speculative.mtp_policy,
+        .context_proposal_tokens = options.speculative.context_proposal_tokens,
         .features       = qwen3_6::startup_features(options),
         .vision_max_merged = std::max<std::uint32_t>(1, options.vision_max_merged_tokens),
         .use_cuda_graph = options.use_cuda_graph,

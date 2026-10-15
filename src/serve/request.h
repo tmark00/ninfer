@@ -164,11 +164,14 @@ requested_reasoning_effort_name(RequestedReasoningEffort effort) noexcept {
     return {};
 }
 
+// Longest accepted tool name on every endpoint; also the tool-call parser's name budget.
+inline constexpr std::size_t kMaxToolNameLength = 128;
+
 struct GenerationRequest {
     std::string model;
     std::vector<ChatTurn> messages;
     std::vector<ToolDefinition> tools;
-    std::size_t tool_name_max_length = 64;
+    std::size_t tool_name_max_length = kMaxToolNameLength;
     ToolChoice tool_choice;
     std::vector<std::string> stop_strings;
     int max_tokens      = 0; // 0 => use server default; set via max_tokens_set when client pinned a value

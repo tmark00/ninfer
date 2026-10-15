@@ -355,6 +355,20 @@ int test_explicit_rejections() {
                                 Json{{"type", "function"}, {"name", "f"}, {"parameters", Json::object()}, {"strict", false}}});
     failures += check(throws_api([&] { (void)parse_responses_request(dup, limits()); }),
                       "duplicate function tool names rejected");
+
+    const auto named_tool = [](std::size_t length) {
+        return Json{{"type", "function"}, {"name", std::string(length, 'a')},
+                    {"parameters", Json::object()}, {"strict", false}};
+    };
+    Json max_name     = base;
+    max_name["tools"] = Json::array({named_tool(128)});
+    failures += check(parse_responses_request(max_name, limits()).generation.tools[0].name.size() ==
+                          128,
+                      "128-character function name accepted");
+    Json too_long     = base;
+    too_long["tools"] = Json::array({named_tool(129)});
+    failures += check(throws_api([&] { (void)parse_responses_request(too_long, limits()); }),
+                      "129-character function name rejected");
     return failures;
 }
 

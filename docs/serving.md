@@ -674,6 +674,8 @@ type(s) are all valid non-string JSON Schema types are deserialized. Parameters 
 `"type"`, and parameters absent from the schema preserve the model's raw text so the string
 contract reaches the client intact. Full JSON Schema validation (constraints, required sets,
 formats, nested keywords) is not performed server-side and remains the client's job.
+Tool names must match `[A-Za-z0-9_-]{1,128}` on all three protocol surfaces; the same limit
+bounds the function name the tool-call parser accepts from model output.
 Duplicate tool names within a single request are rejected with a 400 on all three
 protocol surfaces (OpenAI Chat Completions, OpenAI Responses, Anthropic Messages),
 keeping the per-tool parameter type map unambiguous.

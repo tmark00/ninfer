@@ -73,7 +73,7 @@ std::optional<int> optional_int(const Json& object, const char* key) {
 }
 
 bool valid_function_name(const std::string& name) {
-    if (name.empty() || name.size() > 64) { return false; }
+    if (name.empty() || name.size() > kMaxToolNameLength) { return false; }
     for (const unsigned char c : name) {
         if (std::isalnum(c) == 0 && c != '_' && c != '-') { return false; }
     }
@@ -86,7 +86,7 @@ std::string require_function_name(const Json& object, const char* param) {
     }
     std::string name = object.at("name").get<std::string>();
     if (!valid_function_name(name)) {
-        bad_request("function name must match [A-Za-z0-9_-]{1,64}", param);
+        bad_request("function name must match [A-Za-z0-9_-]{1,128}", param);
     }
     return name;
 }

@@ -465,6 +465,22 @@ int test_parse_function_tools_and_choices() {
     failures +=
         check(throws_api([&] { (void)parse_chat_completion_request(dup, default_limits()); }),
               "duplicate function tool names rejected");
+
+    Json max_name_tool                = tool;
+    max_name_tool["function"]["name"] = std::string(128, 'a');
+    Json max_name                     = base;
+    max_name["tools"]                 = Json::array({max_name_tool});
+    req = parse_chat_completion_request(max_name, default_limits());
+    failures += check(req.tools[0].name.size() == 128, "128-character function name accepted");
+    failures += check(req.tool_name_max_length == 128, "parser name budget matches the limit");
+
+    Json too_long_tool                = tool;
+    too_long_tool["function"]["name"] = std::string(129, 'a');
+    Json too_long                     = base;
+    too_long["tools"]                 = Json::array({too_long_tool});
+    failures +=
+        check(throws_api([&] { (void)parse_chat_completion_request(too_long, default_limits()); }),
+              "129-character function name rejected");
     return failures;
 }
 

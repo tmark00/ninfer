@@ -16,8 +16,6 @@ namespace {
 
 using Json = nlohmann::json;
 
-constexpr std::size_t kMaxToolNameLength = 128;
-
 [[noreturn]] void bad_request(std::string message, std::string param = {}, std::string code = {}) {
     ApiError error;
     error.status  = 400;
@@ -521,7 +519,6 @@ GenerationRequest parse_messages_request(const Json& body, const RequestLimits& 
     require_object(body);
 
     GenerationRequest out;
-    out.tool_name_max_length = kMaxToolNameLength;
     if (!body.contains("model") || !body.at("model").is_string() ||
         body.at("model").get<std::string>().empty()) {
         bad_request("missing required field: model", "model");
